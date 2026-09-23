@@ -108,6 +108,12 @@ claim_smoke() {
         --json "$RESULTS/smoke.json" > "$RESULTS/smoke.stdout" 2>&1 \
         || { tail -20 "$RESULTS/smoke.stdout" >&2; die "smoke run failed"; }
     report smoke "$RESULTS/smoke.json"
+    python3 -c "
+import json, sys
+d = json.load(open('$RESULTS/smoke.json'))
+if d['modules_with_errors'] >= d['ir_modules']:
+    sys.exit('  every module failed to analyse; run scripts/selftest.sh')
+"
 }
 
 claim_table4() { ensure_sweep v619 "$CORPUS_V619" "v6.19"; report table4 "$RESULTS/sweep-v619.json"; }

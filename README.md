@@ -6,11 +6,15 @@ and checks them against the Linux Kernel Memory Model with herd7.
 Artifact for *MBCheck: Practical Static Analysis Framework for Detecting
 Memory Ordering Violations under WMM* (USENIX ATC '26).
 
+The claims can be reproduced two ways: with the
+[prebuilt container image](#dockerized-setup), which needs nothing installed,
+or by [building from source](#manual-setup).
+
 ## Contents
 
-- [Container](#container)
+- [Dockerized setup](#dockerized-setup)
 - [Requirements](#requirements)
-- [Install](#install)
+- [Manual setup](#manual-setup)
   - [1. Packages](#1-packages)
   - [2. SVF 3.2](#2-svf-32)
   - [3. herd7 7.58](#3-herd7-758)
@@ -34,6 +38,8 @@ Memory Ordering Violations under WMM* (USENIX ATC '26).
 
 ## Requirements
 
+For the manual setup. The container image carries all of it.
+
 | | Version |
 |---|---|
 | LLVM / Clang | 18 (newer will not work: mbcheck cannot parse its IR) |
@@ -54,7 +60,7 @@ Clang; nothing runs on arm64.
 | Generate a corpus | ~8 min at 16 jobs |
 | All claims | ~20 min |
 
-## Install
+## Manual setup
 
 Ubuntu 24.04. Steps 1 to 6 take about two hours, most of it compiling.
 
@@ -71,10 +77,6 @@ sudo apt install -y \
     opam m4 bubblewrap
 ```
 
-`llvm-18` provides `llvm-link-18` and `opt-18`, which the corpus generator
-calls by name. Add `dwarves` if your kernel config enables
-`CONFIG_DEBUG_INFO_BTF`; arm64 `defconfig` does not.
-
 ### 2. SVF 3.2
 
 ```sh
@@ -86,7 +88,7 @@ export LLVM_DIR=/usr/lib/llvm-18
 ls Release-build/lib/libSvfCore.a Release-build/lib/extapi.bc
 ```
 
-`SVF_DIR` below is the directory you cloned into, not the build directory.
+`SVF_DIR` below is the directory you cloned into.
 
 ### 3. herd7 7.58
 
@@ -96,6 +98,8 @@ eval "$(opam env)"
 opam install -y herdtools7.7.58
 herd7 -version
 ```
+
+Or.
 
 An opam install puts the `.cat` files where herd7 finds them. A source build
 does not, so set `HERD7` and `HERDLIB`:
@@ -125,8 +129,6 @@ scripts/selftest.sh
 and no corpus. It reports 2 anchors, 2 causal brackets, 1 litmus test, and an
 `Ok` from herd7 if herd7 is installed.
 
-No `.ll` files ship in this repository; they are all generated.
-
 ### 5. Kernel tree
 
 The corpus is regenerated from the compile commands a build records in its
@@ -140,12 +142,6 @@ cd linux-6.19
 make LLVM=-18 ARCH=arm64 defconfig
 make LLVM=-18 ARCH=arm64 -j"$(nproc)"
 ```
-
-`LLVM=-18`, not `LLVM=1`: step 1 installs versioned tool names only, so
-`LLVM=1` finds no `clang` or `ld.lld`, and on a machine with a newer LLVM
-under those names it produces IR that LLVM 18 cannot read.
-
-Only the recorded compile commands are used afterwards, not the kernel image.
 
 ### 6. IR corpus
 
@@ -177,15 +173,28 @@ export KDIR=~/linux-6.19        # table8 only
 `HERD7` and `HERDLIB` only when herd7 is not on `$PATH` or its `.cat` files
 cannot be found from the binary.
 
-## Container
+## Dockerized setup
 
-A prebuilt image with the toolchain, the kernel tree and the IR corpus
-already in place:
+A prebuilt image with the toolchain, the Linux v6.19 tree and the IR corpus
+already in place. mbcheck is compiled in the image, so nothing has to be
+built and the claims can be run straight away.
 
 ```sh
+docker pull ghcr.io/ssrg-vt/mbcheck:atc26
 docker run --rm -it ghcr.io/ssrg-vt/mbcheck:atc26
-scripts/run.sh smoke
 ```
+
+The shell opens in `/home/ae/mbcheck` as user `ae`, with the corpus, kernel
+tree and herd7 paths already set:
+
+```sh
+scripts/run.sh smoke
+scripts/run.sh table4
+```
+
+Run the claims in one session: tables 4 to 9 share a cached sweep, and
+`--rm` discards it when the container exits. Skip to [Claims](#claims) for
+what each one reports. 
 
 ## Quick start
 
@@ -204,11 +213,7 @@ scripts/run.sh table4
 ## Claims
 
 One command each; each prints the values it measured. Tables 4 to 9 derive
-from one sweep, cached under `results/`, so order does not matter and only the
-first pays. `--force` re-runs the sweep; `--jobs N` and `--timeout SEC` are
-also accepted.
-
-The figures below are what the reference machine produced.
+from one sweep, cached under `results/`.
 
 ### smoke
 
@@ -297,9 +302,6 @@ patterns*, MBCheck column: the 23 correctly synchronised cases of Table 10,
 all of which should be true negatives. About 2 minutes. Needs `$KDIR`.
 
 **Expectation:** 23 true negatives, 0 false positives.
-
-The paper's OFence, OZZ, KCSAN and Dat3M columns are not part of this
-artifact.
 
 ### table9
 
