@@ -1,3 +1,4 @@
+#include "lib/phase_timer.h"
 #include <filesystem>
 #include <fstream>
 
@@ -22,7 +23,6 @@
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 
 #include "Util/ExtAPI.h"
-#include "lib/phase_timer.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -106,6 +106,35 @@ static cl::list<std::string> DisableHeuristic(
     cl::value_desc("name"),
     cl::ZeroOrMore,
     cl::CommaSeparated,
+    cl::cat(MBCheckCategory));
+
+// Action 2 — strict-publish synthesis.  Synthesises additional candidate
+// anchor brackets from plain shared-global store pairs (payload, flag) that
+// have no surrounding release barrier.  Aimed at uncovering real-kernel
+// message-passing bugs that the anchor-table-driven pipeline misses entirely.
+static cl::opt<bool> StrictPublish(
+    "strict-publish",
+    cl::desc("Synthesise plain-publish anchor brackets in CausalDetect for "
+             "functions that do two consecutive plain stores to distinct "
+             "shared globals without any release ordering. Off by default."),
+    cl::cat(MBCheckCategory));
+
+// v14 path-1 — Cross-TU init/exit seed files.  One function name per line;
+// blank lines and lines starting with '#' are ignored.  Names that are not
+// defined in this TU are silently dropped.  See run_kernel_noLTO.py
+// `--init-seed-file` for how the kernel runner pre-computes these.
+static cl::opt<std::string> InitSeedFile(
+    "init-seed-file",
+    cl::desc("Path to a file listing function names that are globally "
+             "init-only (cross-TU closure of __initcall callers).  Names "
+             "found in this TU are pre-seeded into LifecycleHeuristic "
+             "initOnly so H27 propagation can expand them."),
+    cl::value_desc("path"),
+    cl::cat(MBCheckCategory));
+static cl::opt<std::string> ExitSeedFile(
+    "exit-seed-file",
+    cl::desc("Like --init-seed-file but for globally exit-only functions."),
+    cl::value_desc("path"),
     cl::cat(MBCheckCategory));
 
 // ---------------------------------------------------------------------------
@@ -646,16 +675,60 @@ int main(int argc, char **argv)
         setDisabledHeuristics(std::move(dis));
     }
 
+    // Action 2 — push --strict-publish flag into CausalDetectPass.
+    if (StrictPublish) {
+        errs() << "[mbcheck] strict-publish: synthesising plain-publish "
+                  "brackets in CausalDetectPass\n";
+        setStrictPublish(true);
+    }
+
+    // v14 path-1 — load cross-TU init/exit seed files and stash them for
+    // FnHeuristicsFilterPass to consume.
+    {
+        auto loadSeeds = [&](const std::string &path,
+                             const char *kindLabel,
+                             void (*setter)(std::set<std::string>)) {
+            if (path.empty()) return;
+            std::ifstream in(path);
+            if (!in) {
+                errs() << "[mbcheck] WARNING: cannot open " << kindLabel
+                       << "-seed file: " << path << "\n";
+                return;
+            }
+            std::set<std::string> names;
+            std::string line;
+            while (std::getline(in, line)) {
+                while (!line.empty() &&
+                       (line.back() == '\r' || line.back() == '\n' ||
+                        line.back() == ' '  || line.back() == '\t'))
+                    line.pop_back();
+                size_t b = 0;
+                while (b < line.size() &&
+                       (line[b] == ' ' || line[b] == '\t')) ++b;
+                if (b >= line.size()) continue;
+                if (line[b] == '#') continue;
+                names.insert(line.substr(b));
+            }
+            errs() << "[mbcheck] " << kindLabel << "-seed file: "
+                   << names.size() << " names from " << path << "\n";
+            setter(std::move(names));
+        };
+        loadSeeds(InitSeedFile, "init", setExtraInitOnly);
+        loadSeeds(ExitSeedFile, "exit", setExtraExitOnly);
+    }
+
     // extapi.bc: $MBCHECK_EXTAPI_BC, then $SVF_DIR (SVF's own lookup), then
     // the path recorded at configure time.
-    if (const char *p = std::getenv("MBCHECK_EXTAPI_BC")) {
-        if (!SVF::ExtAPI::setExtBcPath(p))
-            errs() << "[mbcheck] WARNING: MBCHECK_EXTAPI_BC is not readable: "
-                   << p << "\n";
-    } else if (!std::getenv("SVF_DIR")) {
+    {
+        if (const char *p = std::getenv("MBCHECK_EXTAPI_BC")) {
+            if (!SVF::ExtAPI::setExtBcPath(p))
+                errs() << "[mbcheck] WARNING: MBCHECK_EXTAPI_BC is not "
+                          "readable: " << p << "\n";
+        } else if (!std::getenv("SVF_DIR")) {
 #ifdef MBCHECK_SVF_EXTAPI_BC
-        SVF::ExtAPI::setExtBcPath(MBCHECK_SVF_EXTAPI_BC);
+            SVF::ExtAPI::setExtBcPath(MBCHECK_SVF_EXTAPI_BC);
 #endif
+        }
     }
 
     llvm_shutdown_obj SDO;
@@ -663,55 +736,61 @@ int main(int argc, char **argv)
     LLVMContext ctx;
     SMDiagnostic err;
 
-    mbtime::Scope *tLoad = new mbtime::Scope("ir_load");
-    unique_ptr<Module> mergedIR = parseIRFile(InputFiles[0], err, ctx);
-    if (!mergedIR)
+    // The nested scope exists so that "other" — everything the named phases
+    // do not cover, including tearing the module down — is closed before the
+    // phase table is printed.
     {
-        err.print(argv[0], llvm::errs());
-        return 1;
-    }
+        mbtime::Scope _tOther("other");
 
-    if (InputFiles.size() > 1)
-    {
-        Linker linker(*mergedIR);
-        for (unsigned i = 1; i < InputFiles.size(); ++i)
+        unique_ptr<Module> mergedIR;
         {
-            unique_ptr<Module> m = parseIRFile(InputFiles[i], err, ctx);
-            if (!m)
+            mbtime::Scope _tLoad("ir_load");
+            mergedIR = parseIRFile(InputFiles[0], err, ctx);
+            if (!mergedIR)
             {
                 err.print(argv[0], llvm::errs());
                 return 1;
             }
-            if (linker.linkInModule(std::move(m)))
+
+            if (InputFiles.size() > 1)
             {
-                llvm::errs() << "Error: failed to link " << InputFiles[i] << "\n";
-                return 1;
+                Linker linker(*mergedIR);
+                for (unsigned i = 1; i < InputFiles.size(); ++i)
+                {
+                    unique_ptr<Module> m = parseIRFile(InputFiles[i], err, ctx);
+                    if (!m)
+                    {
+                        err.print(argv[0], llvm::errs());
+                        return 1;
+                    }
+                    if (linker.linkInModule(std::move(m)))
+                    {
+                        llvm::errs() << "Error: failed to link " << InputFiles[i] << "\n";
+                        return 1;
+                    }
+                }
             }
         }
-    }
 
-    delete tLoad;
-
-    {
-        mbtime::Scope tOther("other");
-    if (ShowAnchors)
-        runAnchorPass(*mergedIR);
-    else if (ShowCausal)
-        runCausalDetect(*mergedIR);
-    else if (ShowPairs)
-        runFunctionPairs(*mergedIR);
-    else if (ShowFilter)
-        runFilteredPairs(*mergedIR);
-    else if (!ShowLitmus.empty())
-        runHerd7Transpiler(*mergedIR, ShowLitmus);
-    else if (ShowVerify)
-        runVerifier(*mergedIR);
-    else if (ShowStats)
-        runStats(*mergedIR);
-    else
-        runPTAPass(*mergedIR);
+        if (ShowAnchors)
+            runAnchorPass(*mergedIR);
+        else if (ShowCausal)
+            runCausalDetect(*mergedIR);
+        else if (ShowPairs)
+            runFunctionPairs(*mergedIR);
+        else if (ShowFilter)
+            runFilteredPairs(*mergedIR);
+        else if (!ShowLitmus.empty())
+            runHerd7Transpiler(*mergedIR, ShowLitmus);
+        else if (ShowVerify)
+            runVerifier(*mergedIR);
+        else if (ShowStats)
+            runStats(*mergedIR);
+        else
+            runPTAPass(*mergedIR);
     }
 
     mbtime::printStats();
+
     return 0;
 }

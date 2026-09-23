@@ -21,6 +21,7 @@
 #include <set>
 #include <unordered_set>
 #include <functional>
+#include <array>
 
 using namespace llvm;
 using namespace SVF;
@@ -37,6 +38,32 @@ void setDisabledHeuristics(std::set<std::string> names) {
 }
 const std::set<std::string> &disabledHeuristics() {
     return mutableDisabledHeuristics();
+}
+
+// ---------------------------------------------------------------------------
+// Cross-TU init/exit seed storage (v14 path 1)
+// ---------------------------------------------------------------------------
+// Populated from --init-seed-file / --exit-seed-file (one symbol name per
+// line).  Read by LifecycleHeuristic data-collection in
+// FnHeuristicsFilterPass::run() to expand the H27 fixpoint seeds beyond what
+// is locally observable from .init.text + initcall asm in this single TU.
+static std::set<std::string> &mutableExtraInitOnly() {
+    static std::set<std::string> g; return g;
+}
+static std::set<std::string> &mutableExtraExitOnly() {
+    static std::set<std::string> g; return g;
+}
+void setExtraInitOnly(std::set<std::string> names) {
+    mutableExtraInitOnly() = std::move(names);
+}
+void setExtraExitOnly(std::set<std::string> names) {
+    mutableExtraExitOnly() = std::move(names);
+}
+const std::set<std::string> &extraInitOnly() {
+    return mutableExtraInitOnly();
+}
+const std::set<std::string> &extraExitOnly() {
+    return mutableExtraExitOnly();
 }
 
 AnalysisKey FnHeuristicsFilterPass::Key;
@@ -728,6 +755,161 @@ static std::string classifyBenignFnName(const std::string &name) {
 
 } // anonymous namespace
 
+// ---------------------------------------------------------------------------
+// RegistrationPublishHeuristic (v10: B1 + B6)
+// ---------------------------------------------------------------------------
+std::string RegistrationPublishHeuristic::isMutuallyExclusive(
+    const FunctionPair      &pair,
+    Module                  & /*M*/,
+    ModuleAnalysisManager   & /*MAM*/) const
+{
+    auto check = [&](const std::string &registrar,
+                     const std::string &callback) -> std::string {
+        auto it = registeredBy_.find(callback);
+        if (it == registeredBy_.end()) return "";
+        if (it->second.count(registrar))
+            return "publish-by:" + registrar;
+        return "";
+    };
+    std::string s = check(pair.anchorFn, pair.partnerFn);
+    if (!s.empty()) return s;
+    return check(pair.partnerFn, pair.anchorFn);
+}
+
+// ---------------------------------------------------------------------------
+// PmPhaseHeuristic (v10: B5)
+// ---------------------------------------------------------------------------
+namespace {
+static bool endsWithSuf(const std::string &s, const char *suf) {
+    size_t l = std::strlen(suf);
+    return s.size() >= l && s.compare(s.size() - l, l, suf) == 0;
+}
+static bool isPmSuspendPhaseName(const std::string &n) {
+    return endsWithSuf(n, "_suspend")        ||
+           endsWithSuf(n, "_suspend_late")   ||
+           endsWithSuf(n, "_suspend_noirq")  ||
+           endsWithSuf(n, "_suspend_early")  ||
+           endsWithSuf(n, "_freeze")         ||
+           endsWithSuf(n, "_freeze_late")    ||
+           endsWithSuf(n, "_freeze_noirq")   ||
+           endsWithSuf(n, "_poweroff")       ||
+           endsWithSuf(n, "_poweroff_late")  ||
+           endsWithSuf(n, "_poweroff_noirq");
+}
+static bool isPmResumePhaseName(const std::string &n) {
+    return endsWithSuf(n, "_resume")         ||
+           endsWithSuf(n, "_resume_early")   ||
+           endsWithSuf(n, "_resume_noirq")   ||
+           endsWithSuf(n, "_thaw")           ||
+           endsWithSuf(n, "_thaw_early")     ||
+           endsWithSuf(n, "_thaw_noirq")     ||
+           endsWithSuf(n, "_restore")        ||
+           endsWithSuf(n, "_restore_early")  ||
+           endsWithSuf(n, "_restore_noirq");
+}
+} // namespace
+
+std::string PmPhaseHeuristic::isMutuallyExclusive(
+    const FunctionPair      &pair,
+    Module                  & /*M*/,
+    ModuleAnalysisManager   & /*MAM*/) const
+{
+    // Soundness: requires BOTH sides to be PM phase callbacks, so we cannot
+    // accidentally suppress a probe-vs-resume or runtime-vs-suspend pair.
+    bool aSus = isPmSuspendPhaseName(pair.anchorFn);
+    bool aRes = isPmResumePhaseName(pair.anchorFn);
+    bool bSus = isPmSuspendPhaseName(pair.partnerFn);
+    bool bRes = isPmResumePhaseName(pair.partnerFn);
+    if ((aSus && bRes) || (aRes && bSus))
+        return "suspend-vs-resume";
+    // Two functions in the same PM phase (both suspend-* or both resume-*)
+    // run sequentially per device — dpm_list_mtx serialises dispatch.
+    if (aSus && bSus) return "suspend-vs-suspend";
+    if (aRes && bRes) return "resume-vs-resume";
+    return "";
+}
+
+// ---------------------------------------------------------------------------
+// SeqcountReaderWriterHeuristic (v10: B2)
+//
+// Curated lists of writer / reader sides for subsystems whose seqcount API
+// is fully inlined (so name-based callee detection cannot see it).
+// Soundness: every entry below has been audited to follow the
+// write_seqcount_begin/end (writer) or read_seqcount_begin/retry (reader)
+// pattern on the SAME seqcount instance.
+// ---------------------------------------------------------------------------
+namespace {
+static const std::set<std::string> &seqcountWriterFns() {
+    static const std::set<std::string> s = {
+        // kernel/time/timekeeping.c — writers hold tk_core.lock raw_spinlock
+        // and bracket stores in write_seqcount_begin/end on tk_core.seq.
+        "timekeeping_resume",
+        "timekeeping_suspend",
+        "timekeeping_init",
+        "timekeeping_inject_offset",
+        "timekeeping_inject_sleeptime64",
+        "do_settimeofday64",
+        "do_adjtimex",
+        "tk_set_wall_to_mono",
+        "update_wall_time",
+        "tk_setup_internals",
+        // kernel/time/timekeeping.c fast-path writer
+        "update_fast_timekeeper",
+    };
+    return s;
+}
+static const std::set<std::string> &seqcountReaderFns() {
+    static const std::set<std::string> s = {
+        // kernel/time/timekeeping.c — readers loop on read_seqcount_begin/retry
+        // against tk_core.seq / tk_fast_mono.seq / tk_fast_raw.seq.
+        "ktime_get",
+        "ktime_get_ts64",
+        "ktime_get_raw",
+        "ktime_get_raw_ts64",
+        "ktime_get_real_ts64",
+        "ktime_get_real_ts64_mg",
+        "ktime_get_snapshot",
+        "ktime_get_with_offset",
+        "ktime_get_update_offsets_now",
+        "ktime_get_coarse_ts64",
+        "ktime_get_coarse_real_ts64",
+        "ktime_get_seconds",
+        "ktime_get_real_seconds",
+        "ktime_get_boottime_seconds",
+        "ktime_get_clocktai_seconds",
+        "ktime_get_mono_fast_ns",
+        "ktime_get_raw_fast_ns",
+        "ktime_get_boot_fast_ns",
+        "ktime_get_tai_fast_ns",
+        "ktime_get_real_fast_ns",
+        "get_device_system_crosststamp",
+        "random_get_entropy_fallback",
+    };
+    return s;
+}
+} // namespace
+
+std::string SeqcountReaderWriterHeuristic::isMutuallyExclusive(
+    const FunctionPair      &pair,
+    Module                  & /*M*/,
+    ModuleAnalysisManager   & /*MAM*/) const
+{
+    const auto &W = seqcountWriterFns();
+    const auto &R = seqcountReaderFns();
+    bool aW = W.count(pair.anchorFn)  > 0;
+    bool aR = R.count(pair.anchorFn)  > 0;
+    bool bW = W.count(pair.partnerFn) > 0;
+    bool bR = R.count(pair.partnerFn) > 0;
+    // Writer vs reader: benign by seqcount-retry design.
+    if ((aW && bR) || (aR && bW)) return "seqcount-read+write";
+    // Two writers serialize via the underlying spinlock — caught by
+    // LockAlias if it sees the same lock; otherwise still mutex by name.
+    if (aW && bW)                 return "seqcount-write+write";
+    // Two readers don't write anything shared → not a race.
+    if (aR && bR)                 return "seqcount-read+read";
+    return "";
+}
+
 std::string SeqlockRetryHeuristic::isMutuallyExclusive(
     const FunctionPair      &pair,
     Module                  & /*M*/,
@@ -778,8 +960,7 @@ std::string BenignAnchorHeuristic::isMutuallyExclusive(
 FnHeuristicsFilterResult
 FnHeuristicsFilterPass::run(Module &M, ModuleAnalysisManager &MAM)
 {
-    mbtime::Scope _t("mutex_filtering");
-
+    mbtime::Scope _tFilter("mutex_filtering");
     FnHeuristicsFilterResult result;
 
     // ── 1. Obtain FunctionPairs ────────────────────────────────────────────
@@ -909,6 +1090,135 @@ FnHeuristicsFilterPass::run(Module &M, ModuleAnalysisManager &MAM)
                n.ends_with("_runtime_suspend") ||
                n.ends_with("_runtime_idle");
     };
+
+    // v10: RegistrationPublishHeuristic data collection.
+    //   registeredBy[callback_fn_name] = set of registering-fn-names
+    // Populated below from every kernel registration API call site.
+    std::map<std::string, std::set<std::string>> registeredBy;
+
+    // ── v14: __initcall_* / __exitcall_* module-asm parser ───────────────
+    //
+    // Kernel initcalls / exitcalls are registered via macro-generated module
+    // asm of the form:
+    //   __initcall__kmod_<mod>__<line>_<counter>[_]_<funcname><level>[s]:
+    //   __exitcall__kmod_<mod>__<line>_<counter>[_]_<funcname>:
+    // where <level> ∈ { 0..7, early, rootfs, con, arch, subsys, fs, device,
+    // late }.  A trailing `s` marks "statically linked into vmlinux".
+    //
+    // The function itself is NOT necessarily in `.init.text` (the helper
+    // body may be plain text so it can be referenced from runtime call
+    // sites too), but its primary entry — the initcall registration — is
+    // sufficient to classify it as init-only for our heuristic purposes.
+    // Initcalls execute single-threaded on the boot CPU before user-space
+    // launches; concurrent runtime code cannot race with them.
+    //
+    // Adding these function names to `initOnly` (resp. `exitOnly`) below
+    // both:
+    //   • seeds the H27 `moduleInitOnly` fixpoint with the entry point, and
+    //   • triggers the LifecycleHeuristic `aMdInit || bMdInit` filter for
+    //     all pairs in which the initcall function appears as either side.
+    {
+        static const std::array<llvm::StringRef, 16> kLevels = {{
+            "early", "rootfs", "subsys", "device", "late",
+            "arch", "con", "fs",
+            "0", "1", "2", "3", "4", "5", "6", "7"
+        }};
+
+        // Walk the trailing portion of an initcall/exitcall token and try to
+        // identify the encoded function name.  Token has the shape:
+        //
+        //   _kmod_<mod>__<line>_<counter>[_]<funcname><level>[s]
+        //
+        // where <funcname> may itself begin with one or more underscores
+        // (e.g. "__gnttab_init"), the separator before <funcname> may
+        // therefore be any number of underscores (>= 1), and the level
+        // suffix may be absent (exitcalls always; some initcalls).  Trailing
+        // `s` is the "statically linked" marker emitted for vmlinux builds.
+        //
+        // Strategy: peel optional trailing 's' + level suffix, then scan
+        // every suffix-of-token starting from the leftmost candidate
+        // position to the rightmost and return the first one that names an
+        // existing function in this module.  This handles both leading-`_`
+        // names and the variable-length module/line/counter prefix.
+        auto extractFuncName = [&](llvm::StringRef token,
+                                   bool requireLevel) -> std::string {
+            if (token.empty()) return {};
+
+            // Generate (body, hasLevel) candidates by stripping the optional
+            // trailing 's' and then optionally a level suffix.
+            std::vector<std::string> candidates;
+            auto pushBodyForms = [&](llvm::StringRef b) {
+                // No level stripped.
+                if (!requireLevel) candidates.emplace_back(b.str());
+                // With level stripped.
+                for (llvm::StringRef lvl : kLevels) {
+                    if (b.ends_with(lvl) && b.size() > lvl.size())
+                        candidates.emplace_back(b.drop_back(lvl.size()).str());
+                }
+            };
+            pushBodyForms(token);
+            if (token.ends_with("s") && token.size() > 1)
+                pushBodyForms(token.drop_back());
+
+            // For each candidate body, scan from earliest-possible start to
+            // latest-possible start; return the first that names a real
+            // function.  We prefer LONGER matches (earlier start) because
+            // function names that begin with '_' or '__' are common.
+            for (const auto &body : candidates) {
+                llvm::StringRef b(body);
+                for (size_t s = 0; s < b.size(); ++s) {
+                    llvm::StringRef cand = b.drop_front(s);
+                    if (cand.empty()) break;
+                    if (M.getFunction(cand))
+                        return cand.str();
+                }
+            }
+            return {};
+        };
+
+        auto scan = [&](llvm::StringRef asmStr,
+                        llvm::StringRef prefix,
+                        bool requireLevel,
+                        std::set<std::string> &dst) {
+            size_t pos = 0;
+            while ((pos = asmStr.find(prefix, pos)) != llvm::StringRef::npos) {
+                size_t start = pos + prefix.size();
+                size_t end = start;
+                while (end < asmStr.size()) {
+                    char c = asmStr[end];
+                    if (c == ':' || c == ' ' || c == '\t' || c == '\n' ||
+                        c == '\r' || c == '\\' || c == '"')
+                        break;
+                    ++end;
+                }
+                if (end > start) {
+                    llvm::StringRef token = asmStr.substr(start, end - start);
+                    std::string fname = extractFuncName(token, requireLevel);
+                    if (!fname.empty())
+                        dst.insert(fname);
+                }
+                pos = end;
+            }
+        };
+
+        llvm::StringRef modAsm = M.getModuleInlineAsm();
+        scan(modAsm, "__initcall_", /*requireLevel=*/true,  initOnly);
+        scan(modAsm, "__exitcall_", /*requireLevel=*/false, exitOnly);
+    }
+
+    // ── v14 path-1: cross-TU init/exit seeds ─────────────────────────────
+    //
+    // The kernel runner pre-computes globally-init-only and globally-exit-only
+    // function names (via a whole-tree call-graph fixpoint over every .ll
+    // file) and pushes them in via setExtraInitOnly / setExtraExitOnly.
+    // Filter to names that actually exist as definitions in this TU; H27
+    // propagation below will then expand transitively from this richer seed.
+    {
+        for (const std::string &n : extraInitOnly())
+            if (M.getFunction(n)) initOnly.insert(n);
+        for (const std::string &n : extraExitOnly())
+            if (M.getFunction(n)) exitOnly.insert(n);
+    }
 
     for (Function &F : M) {
         if (F.isDeclaration())
@@ -1076,11 +1386,53 @@ FnHeuristicsFilterPass::run(Module &M, ModuleAnalysisManager &MAM)
                 //
                 // We use callee-name + arg index; the function-pointer arg
                 // is matched via dyn_cast<Function>(operand stripped of casts).
+                //
+                // v10: also record into `registeredBy[handler] = {fname}` so
+                // RegistrationPublishHeuristic can suppress (registrar, handler)
+                // pairs as publication-ordered.
                 auto seedIrqHandler = [&](unsigned argIdx) {
                     if (argIdx >= CI->arg_size()) return;
                     const Value *v = CI->getArgOperand(argIdx)->stripPointerCasts();
-                    if (const auto *fn = dyn_cast<Function>(v))
+                    if (const auto *fn = dyn_cast<Function>(v)) {
                         irqReachable.insert(fn->getName().str());
+                        registeredBy[fn->getName().str()].insert(fname);
+                    }
+                };
+                // v10: registration APIs that take a struct-pointer with
+                // callback function-pointer fields.  Walk the struct's
+                // initializer (constant) and record every Function* found
+                // as registered by `fname`.  Used for platform_driver,
+                // cpufreq, genpd, console, notifier_block, led_classdev,
+                // sysfs binary attributes etc.
+                std::set<const Constant *> regWalkVisited;
+                std::function<void(const Constant *)> regWalk =
+                    [&](const Constant *c) {
+                    if (!c || !regWalkVisited.insert(c).second) return;
+                    if (const auto *fn = dyn_cast<Function>(c)) {
+                        registeredBy[fn->getName().str()].insert(fname);
+                        return;
+                    }
+                    if (const auto *GV = dyn_cast<GlobalVariable>(c)) {
+                        if (GV->hasInitializer())
+                            regWalk(GV->getInitializer());
+                        return;
+                    }
+                    if (isa<GlobalValue>(c)) return;
+                    const Value *stripped = c->stripPointerCasts();
+                    if (const auto *fn = dyn_cast<Function>(stripped)) {
+                        registeredBy[fn->getName().str()].insert(fname);
+                        return;
+                    }
+                    for (unsigned i = 0, n = c->getNumOperands(); i < n; ++i)
+                        regWalk(dyn_cast<Constant>(c->getOperand(i)));
+                };
+                auto seedRegStruct = [&](unsigned argIdx) {
+                    if (argIdx >= CI->arg_size()) return;
+                    const Value *v =
+                        CI->getArgOperand(argIdx)->stripPointerCasts();
+                    if (const auto *GV = dyn_cast<GlobalVariable>(v))
+                        if (GV->hasInitializer())
+                            regWalk(GV->getInitializer());
                 };
                 if (cn == "request_irq")              seedIrqHandler(1);
                 else if (cn == "request_threaded_irq") { seedIrqHandler(1); seedIrqHandler(2); }
@@ -1113,6 +1465,158 @@ FnHeuristicsFilterPass::run(Module &M, ModuleAnalysisManager &MAM)
                          cn == "INIT_DELAYED_WORK_ONSTACK_KEY" ||
                          cn == "__INIT_DELAYED_WORK_WITH_KEY")
                                                       seedIrqHandler(1);
+
+                // v10 (B1+B6): direct-handler registration APIs (extends
+                // the IRQ-handler seeding above with publication-only
+                // ordering — these do NOT mark the callee as IRQ-context
+                // (so we do not enter `irqReachable`); they only record the
+                // publish edge in `registeredBy`).
+                auto recordPublishDirect = [&](unsigned argIdx) {
+                    if (argIdx >= CI->arg_size()) return;
+                    const Value *v = CI->getArgOperand(argIdx)
+                                       ->stripPointerCasts();
+                    if (const auto *fn = dyn_cast<Function>(v))
+                        registeredBy[fn->getName().str()].insert(fname);
+                };
+                if (cn == "irq_set_chained_handler" ||
+                    cn == "irq_set_chained_handler_and_data" ||
+                    cn == "irq_set_handler" ||
+                    cn == "__irq_set_handler" ||
+                    cn == "irq_set_handler_locked")
+                    recordPublishDirect(1);
+                else if (cn == "cpuhp_setup_state" ||
+                         cn == "__cpuhp_setup_state" ||
+                         cn == "cpuhp_setup_state_nocalls" ||
+                         cn == "__cpuhp_setup_state_nocalls" ||
+                         cn == "cpuhp_setup_state_multi" ||
+                         cn == "cpuhp_setup_state_cpuslocked") {
+                    // signature: (state, name, startup, teardown)
+                    recordPublishDirect(2);
+                    recordPublishDirect(3);
+                }
+                else if (cn == "smp_call_function_single" ||
+                         cn == "smp_call_function_any" ||
+                         cn == "smp_call_function" ||
+                         cn == "on_each_cpu")
+                    recordPublishDirect(1);
+                else if (cn == "stop_one_cpu" || cn == "stop_machine")
+                    recordPublishDirect(1);
+
+                // v10 (B1+B6): struct-pointer registration APIs — walk the
+                // initializer of the argument global and record every
+                // Function* found as published-by `fname`.
+                //
+                // Soundness: we only walk literal global initialisers, so
+                // the registered callback set is provably bounded by the
+                // module's static data.  The publish guarantee holds
+                // because the registration call is a real kernel API that
+                // commits to the registry only after the caller's prior
+                // stores are flushed.
+                else if (cn == "register_console" ||
+                         cn == "register_console_locked")
+                    seedRegStruct(0);
+                else if (cn == "cpufreq_register_driver" ||
+                         cn == "cpufreq_register_governor" ||
+                         cn == "cpufreq_register_notifier")
+                    seedRegStruct(0);
+                else if (cn == "platform_driver_register" ||
+                         cn == "__platform_driver_register" ||
+                         cn == "platform_driver_probe" ||
+                         cn == "__platform_driver_probe")
+                    seedRegStruct(0);
+                else if (cn == "i2c_register_driver" ||
+                         cn == "__i2c_register_driver")
+                    seedRegStruct(1);   // (owner, driver)
+                else if (cn == "spi_register_driver" ||
+                         cn == "__spi_register_driver")
+                    seedRegStruct(0);
+                else if (cn == "pci_register_driver" ||
+                         cn == "__pci_register_driver")
+                    seedRegStruct(0);
+                else if (cn == "usb_register_driver" ||
+                         cn == "__usb_register_driver" ||
+                         cn == "usb_register")
+                    seedRegStruct(0);
+                else if (cn == "mmc_register_driver" ||
+                         cn == "__mmc_register_driver")
+                    seedRegStruct(0);
+                else if (cn == "tty_register_driver" ||
+                         cn == "tty_register_ldisc")
+                    seedRegStruct(0);
+                else if (cn == "serial_core_register_port" ||
+                         cn == "serial8250_register_8250_port" ||
+                         cn == "uart_register_driver" ||
+                         cn == "uart_add_one_port")
+                    seedRegStruct(0);
+                else if (cn == "pm_genpd_init" ||
+                         cn == "of_genpd_add_provider_simple" ||
+                         cn == "of_genpd_add_provider_onecell" ||
+                         cn == "of_genpd_add_provider")
+                    seedRegStruct(0);
+                else if (cn == "register_sys_off_handler" ||
+                         cn == "devm_register_sys_off_handler" ||
+                         cn == "register_restart_handler" ||
+                         cn == "register_reboot_notifier" ||
+                         cn == "register_die_notifier" ||
+                         cn == "atomic_notifier_chain_register" ||
+                         cn == "blocking_notifier_chain_register" ||
+                         cn == "raw_notifier_chain_register" ||
+                         cn == "srcu_notifier_chain_register")
+                    seedRegStruct(0);
+                else if (cn == "led_trigger_register" ||
+                         cn == "led_trigger_register_simple" ||
+                         cn == "led_classdev_register" ||
+                         cn == "led_classdev_register_ext" ||
+                         cn == "devm_led_classdev_register")
+                    seedRegStruct(0);
+                else if (cn == "sysfs_create_file" ||
+                         cn == "sysfs_create_bin_file" ||
+                         cn == "device_create_file") {
+                    // (kobj/dev, attribute_struct)
+                    seedRegStruct(1);
+                }
+                else if (cn == "sysfs_create_group" ||
+                         cn == "sysfs_create_groups" ||
+                         cn == "sysfs_create_files") {
+                    // (kobj, group_or_attr_array)
+                    seedRegStruct(1);
+                }
+                else if (cn == "device_register" ||
+                         cn == "device_add" ||
+                         cn == "cdev_add" ||
+                         cn == "cdev_device_add")
+                    seedRegStruct(0);
+                else if (cn == "__register_chrdev" ||
+                         cn == "register_chrdev_region")
+                    seedRegStruct(4);   // (major, minor, count, name, fops)
+                else if (cn == "misc_register" ||
+                         cn == "input_register_device" ||
+                         cn == "input_register_handler" ||
+                         cn == "input_register_polled_device")
+                    seedRegStruct(0);
+                else if (cn == "watchdog_register_device" ||
+                         cn == "hwmon_device_register_with_info" ||
+                         cn == "thermal_zone_device_register_with_trips" ||
+                         cn == "thermal_zone_device_register" ||
+                         cn == "thermal_cooling_device_register" ||
+                         cn == "thermal_of_cooling_device_register")
+                    seedRegStruct(0);
+                else if (cn == "rtc_register_device" ||
+                         cn == "devm_rtc_allocate_device" ||
+                         cn == "devm_rtc_device_register")
+                    seedRegStruct(0);
+                else if (cn == "clk_hw_register" ||
+                         cn == "clk_register" ||
+                         cn == "devm_clk_hw_register" ||
+                         cn == "of_clk_add_hw_provider" ||
+                         cn == "of_clk_add_provider")
+                    seedRegStruct(1);
+                else if (cn == "regulator_register" ||
+                         cn == "devm_regulator_register")
+                    seedRegStruct(0);
+                else if (cn == "v4l2_device_register" ||
+                         cn == "video_register_device")
+                    seedRegStruct(0);
 
                 // H_BA+H27: object-initialisation indicator functions.
                 // If a function calls one of these helpers, it is itself in
@@ -1708,6 +2212,16 @@ FnHeuristicsFilterPass::run(Module &M, ModuleAnalysisManager &MAM)
     heuristics.push_back(std::make_unique<SafeAllocationHeuristic>(
         std::move(regmapFns), std::move(dmaSyncFns),
         std::move(seqlockRdFns), std::move(seqlockWrFns)));
+    // v10 B1+B6: RegistrationPublish — probe's registration call provides
+    // publish-ordering for any callback it registers.
+    heuristics.push_back(std::make_unique<RegistrationPublishHeuristic>(
+        std::move(registeredBy)));
+    // v10 B5: PmPhase — PM suspend/resume phase callbacks are temporally
+    // disjoint within a cycle (and ordered across cycles by dpm_list_mtx).
+    heuristics.push_back(std::make_unique<PmPhaseHeuristic>());
+    // v10 B2: SeqcountReadWrite — curated subsystem-level seqcount reader
+    // and writer name list; suppresses by-design lockless retry races.
+    heuristics.push_back(std::make_unique<SeqcountReaderWriterHeuristic>());
     // H2p (ConservativeAnyLock) is intentionally NOT added here.
     // "Both fns hold some exclusive lock" does not imply mutual exclusion
     // unless they hold the *same* lock — which is already handled precisely

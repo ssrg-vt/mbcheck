@@ -22,6 +22,21 @@ void setDisabledHeuristics(std::set<std::string> names);
 const std::set<std::string> &disabledHeuristics();
 
 // ---------------------------------------------------------------------------
+// Cross-TU init/exit seeds (v14 path 1)
+// ---------------------------------------------------------------------------
+// External feeders (the kernel runner) compute the global init-only and
+// exit-only function-name closures across all .ll files (so hidden-linkage
+// wrappers whose entire global caller set is init-only get included) and
+// pass the result to every mbcheck invocation via these setters.  The names
+// are added to the LifecycleHeuristic seed sets *before* the per-module H27
+// fixpoint, expanding the suppression coverage to functions whose init-only
+// status only becomes visible from outside this TU.
+void setExtraInitOnly(std::set<std::string> names);
+void setExtraExitOnly(std::set<std::string> names);
+const std::set<std::string> &extraInitOnly();
+const std::set<std::string> &extraExitOnly();
+
+// ---------------------------------------------------------------------------
 // PairHeuristic — abstract interface for mutual-exclusion heuristics.
 //
 // Subclass and implement isMutuallyExclusive() to indicate that the two
@@ -241,13 +256,12 @@ public:
 //
 // One side brackets its stores in write_seqlock/write_sequnlock, the other
 // reads under read_seqbegin/read_seqretry.  The reader takes no lock and may
-// well observe a torn value; read_seqretry detects the concurrent write and
-// the caller loops.  The ordering is therefore not a happens-before edge and
-// the pair is not a publication defect.
+// observe a torn value; read_seqretry detects the concurrent write and the
+// caller loops, so the pair is not a publication defect.
 // ---------------------------------------------------------------------------
 class SeqlockRetryHeuristic : public PairHeuristic {
-    std::set<std::string> writers_;   // call write_seqlock / write_seqcount_begin
-    std::set<std::string> readers_;   // call read_seqbegin / read_seqretry
+    std::set<std::string> writers_;
+    std::set<std::string> readers_;
 public:
     SeqlockRetryHeuristic(std::set<std::string> writers,
                           std::set<std::string> readers)
@@ -396,6 +410,104 @@ public:
           seqlockWrFns_(std::move(seqlockWr)) {}
 
     const char *name() const override { return "SafeAllocation"; }
+    std::string isMutuallyExclusive(const FunctionPair      &pair,
+                                    llvm::Module             &M,
+                                    llvm::ModuleAnalysisManager &MAM) const override;
+};
+
+// ---------------------------------------------------------------------------
+// RegistrationPublishHeuristic (v10: B1 + B6)
+//
+// Many kernel drivers run an init/probe function that publishes its private
+// state via a "registration" call near the end of probe: request_irq,
+// register_console, platform_driver_register, cpufreq_register_driver,
+// pm_genpd_init, register_sys_off_handler, cpuhp_setup_state, sysfs_*,
+// led_classdev_register, atomic_notifier_chain_register, ...
+//
+// The kernel guarantees that the registered callback cannot be invoked
+// before the registration call returns to its caller.  Therefore every
+// store the registering function performs BEFORE the registration call is
+// ordered before any invocation of the registered partner callback.
+//
+// We model this as: if probe registers a callback C, the pair (probe, C)
+// is mutually exclusive in the precise sense that probe's stores happen
+// strictly before any execution of C.  A causal-ordering anchor inside
+// probe paired against an access in C therefore cannot race.
+//
+// Soundness: only callbacks that are demonstrably argument-passed to a
+// known registration API (either directly, or as a Function* field of the
+// argument struct's initializer) are entered into the map.  This rules
+// out "any callback in this driver" speculation.
+// ---------------------------------------------------------------------------
+class RegistrationPublishHeuristic : public PairHeuristic {
+    // partner-fn-name → set of fn-names that registered partner via a
+    // kernel registration API call.
+    std::map<std::string, std::set<std::string>> registeredBy_;
+public:
+    explicit RegistrationPublishHeuristic(
+        std::map<std::string, std::set<std::string>> m)
+        : registeredBy_(std::move(m)) {}
+    const char *name() const override { return "RegistrationPublish"; }
+    std::string isMutuallyExclusive(const FunctionPair      &pair,
+                                    llvm::Module             &M,
+                                    llvm::ModuleAnalysisManager &MAM) const override;
+};
+
+// ---------------------------------------------------------------------------
+// PmPhaseHeuristic (v10: B5)
+//
+// The kernel PM core drives system suspend/resume through a fixed phase
+// sequence per cycle:
+//   1. _suspend           (per-device .suspend dispatch)
+//   2. _suspend_late      (.suspend_late)
+//   3. _suspend_noirq     (.suspend_noirq)
+//   --- system suspended ---
+//   4. _resume_noirq      (.resume_noirq)
+//   5. _resume_early      (.resume_early)
+//   6. _resume            (.resume)
+// (Hibernation has _freeze / _thaw / _poweroff / _restore variants with
+//  the same phase relationships.)
+//
+// Within a single suspend/resume cycle the suspend phases and resume phases
+// are temporally disjoint: dpm_list_mtx + the PM state machine serialize
+// dispatch per device, and the suspend half completes before the resume
+// half begins.  Across cycles the dpm_list_mtx + power_state ordering
+// supplies a happens-before edge from the end of cycle N to the start of
+// cycle N+1, so cross-cycle reads see prior cycle's writes — not a race.
+//
+// Pair (suspend-phase fn, resume-phase fn) is therefore mutually exclusive.
+// ---------------------------------------------------------------------------
+class PmPhaseHeuristic : public PairHeuristic {
+public:
+    const char *name() const override { return "PmPhase"; }
+    std::string isMutuallyExclusive(const FunctionPair      &pair,
+                                    llvm::Module             &M,
+                                    llvm::ModuleAnalysisManager &MAM) const override;
+};
+
+// ---------------------------------------------------------------------------
+// SeqcountReaderWriterHeuristic (v10: B2)
+//
+// Kernel `seqcount_*` is a lockless read/write synchronization primitive.
+// Writers hold an exclusive (raw_)spinlock AND bracket their stores in
+// write_seqcount_begin / write_seqcount_end.  Readers do not take any
+// lock; they read sequence-begin, do their accesses, then read
+// sequence-retry and loop if the sequence changed.  By design the reader
+// can observe torn values — the retry hides the tear.  At LKMM level the
+// reader's value-load and the writer's value-store both touch the same
+// memory with no acquire/release between them; mbcheck therefore reports
+// the pair as racy.  In practice the seqcount retry loop makes the read
+// safe.
+//
+// We curate the list of functions on each side for subsystems where the
+// seqcount API is fully inlined (timekeeping, etc.) and recognise the
+// pair as benign.  Soundness rests on the per-subsystem curation: every
+// entry below has been manually verified to hold the write-seqcount /
+// read-seqcount pattern.
+// ---------------------------------------------------------------------------
+class SeqcountReaderWriterHeuristic : public PairHeuristic {
+public:
+    const char *name() const override { return "SeqcountReadWrite"; }
     std::string isMutuallyExclusive(const FunctionPair      &pair,
                                     llvm::Module             &M,
                                     llvm::ModuleAnalysisManager &MAM) const override;

@@ -58,6 +58,37 @@ struct CausalDetectResult {
 };
 
 // ---------------------------------------------------------------------------
+// Strict-publish mode (Action 2 — kernel TP detection)
+//
+// When enabled, CausalDetectPass additionally synthesises "plain publish"
+// brackets for functions that exhibit the message-passing (MP) shape WITHOUT
+// any release barrier:
+//
+//   store payload, ptr @P     // plain store (payload)
+//   store flag,    ptr @F     // plain store (publication flag) — NO STLR
+//
+// A synthetic AnchorBracket is created with:
+//   anchor.label = "store (plain, no barrier)"
+//   anchor.site  = "store plain"          (distinguishes from "asm sideeffect")
+//   anchor.ordering = Ordering::Relaxed
+//   anchor.kind  = AnchorKind::Store
+//   anchorAlloc  = SharedAccess for the flag store (channel)
+//   before       = SharedAccess for the payload store
+//   after        = (none)
+//
+// Subsequent passes (function_pairs, fn_heuristics, herd7_transpiler) consume
+// the synthetic bracket uniformly.  herd7_transpiler emits a plain `STR W,[X]`
+// (no `STLR`, no DMB) for the publication, so on AArch64 the litmus exists
+// clause `~exists (1:flag=1 /\ 1:payload=0)` is observable → herd7 reports
+// `No` (ordering violated) — flagging the missing release barrier.
+//
+// Guarded by --strict-publish.  Default off because it generates many new
+// candidate pairs in the real kernel.
+// ---------------------------------------------------------------------------
+void setStrictPublish(bool on);
+bool strictPublish();
+
+// ---------------------------------------------------------------------------
 // CausalDetectPass — LLVM module analysis pass
 //
 // Requires AnchorPass and FSPTAPass to be registered in the same MAM.

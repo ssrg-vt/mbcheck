@@ -94,7 +94,7 @@ def _resolve_herdlib(herd7_bin):
     if herd7_bin is None:
         return None
     for parent in herd7_bin.resolve().parents:
-        for rel in ("herd/libdir", "share/herdtools7/herd/libdir"):
+        for rel in ("herd/libdir", "share/herdtools7/herd"):
             cand = parent / rel
             if (cand / "stdlib.cat").is_file():
                 return str(cand)

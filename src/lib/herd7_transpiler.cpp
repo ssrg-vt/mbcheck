@@ -622,6 +622,19 @@ static void emitAnchor(const AnchorHit &hit,
         return;
     }
 
+    // Action 2 (--strict-publish) synthetic anchor: a *plain* store to the
+    // publication-flag global, with no hardware barrier.  Emit `MOV W; STR
+    // W,[X]` so the litmus models the missing release semantics — herd7
+    // will then correctly observe the MP-violation exists clause.
+    if (anchorAlloc && hit.site == "store plain") {
+        const std::string &var  = vars.var(anchorAlloc->objDesc);
+        const std::string &aReg = regs.addrReg(var);
+        std::string vReg        = regs.valReg(var);
+        lines.push_back("MOV " + toW(vReg) + ",#1");
+        lines.push_back("STR "  + toW(vReg) + ",[" + aReg + "]");
+        return;
+    }
+
     // No specific address — emit a barrier or the mnemonic directly.
     if (hit.site == "asm sideeffect") {
         std::string h7 = mnemonicToHerd7(toLower(hit.label));
@@ -711,8 +724,24 @@ static void emitOrderingOrChannelLoad(
 //   [before access]
 //   [ordering insts between before and anchor]
 //   [anchor instruction(s)]
-//   [ordering insts between anchor and after]
-//   [after access]
+//   [ordering insts between anchor and after]   ← only if anchor is a fence
+//   [after access]                                ← only if anchor is a fence
+//
+// Rationale for the publish-vs-fence distinction:
+//   • Publish anchor (Release/SC store with anchorAlloc, e.g. STLR or
+//     smp_store_release): the release marks the *end* of the producer-side
+//     payload writes that the consumer is allowed to observe.  Anything P0
+//     does AFTER the publish is conceptually post-publish work and is NOT
+//     part of the released data.  Emitting an "after" access on P0 here
+//     produces malformed litmus tests where P0 writes payload AFTER the
+//     release; the consumer can then witness "flag=1 ∧ payload=stale" not
+//     because of any memory-ordering bug but because P0 simply hadn't
+//     written the payload yet.  Such litmus tests are meaningless and were
+//     a major source of false-positive "No" verdicts.
+//   • Fence anchor (anchorAlloc empty, e.g. dmb / dsb): the fence orders
+//     accesses on *both* sides.  Here "before" and "after" are both
+//     producer-side payload accesses that the fence sequences, and both
+//     should appear on P0.
 // ---------------------------------------------------------------------------
 static std::vector<std::string>
 buildAnchorThread(const AnchorBracket &br,
@@ -731,6 +760,52 @@ buildAnchorThread(const AnchorBracket &br,
     if (br.after)
         afterIdx = findInstByIR(insts, br.after->irInst);
 
+    // Distinguish a publish anchor (release/SC store with a target object)
+    // from a pure ordering fence (no anchorAlloc).  Used only for
+    // diagnostic clarity in comments — see dropAfterOnP0 below for the
+    // actual policy.
+    //
+    // Narrow scope: only inline-ASM store-release anchors (stlr / stlxr /
+    // casal / swpal / ldaddal / ldclral / ldsetal / ldeoral) actually
+    // write their anchorAlloc target.  External-function anchors (kfree,
+    // _printk, synchronize_rcu, …) lower to a DMB barrier in emitAnchor —
+    // they do not perform a store-release to the channel variable.
+    const bool isPublishAnchor =
+        br.anchorAlloc.has_value() &&
+        br.anchor.site == "asm sideeffect" &&
+        (br.anchor.ordering == Ordering::Release ||
+         br.anchor.ordering == Ordering::SC);
+    (void)isPublishAnchor;  // retained for documentation
+
+    // --- universal rule: drop the bracket-scan "after" access on P0 ---
+    //
+    // The "after" access produced by CausalDetectPass is the first shared
+    // load/store that follows the anchor in P0's control flow.  This is a
+    // syntactic scan-result, *not* a semantic publication flag:
+    //
+    //   • For a publish anchor (STLR / smp_store_release) the flag IS the
+    //     anchor itself (encoded in anchorAlloc) — whatever comes after is
+    //     post-publish work that the consumer has no reason to observe.
+    //   • For a pure fence anchor (dmb / dsb) the "flag" depends on the
+    //     specific pattern: smp_wmb / smp_rmb / smp_mb has no channel
+    //     object of its own — instead, the BEFORE store is the payload
+    //     and the AFTER store is the publication flag.  P0 must emit
+    //     BOTH, with the fence between them, and P1 reads both.
+    //   • For an external-function acquire / SC anchor (mutex_lock,
+    //     ioremap, of_*_lookup, kfree, synchronize_rcu, …) the function
+    //     lowers to a DMB and never writes a channel variable.
+    //
+    // The MP test we *do* want is: "did the before-payload reach P1 by
+    // the time P1 observed the channel?", which uses
+    //   P0 = [before-store; anchor]                  (publish / external)
+    //   P0 = [before-store; fence; after-store]      (inline-asm fence)
+    //   P1 = [channel-LDAR; partner-loads]
+    //   exists  : ~exists (channel-load=1 /\ before-load=0)
+    const bool isFenceAnchor =
+        !br.anchorAlloc.has_value() &&
+        br.anchor.site == "asm sideeffect";
+    const bool dropAfterOnP0 = !isFenceAnchor;
+
     // --- before access ---
     if (br.before) {
         emitAccess(*br.before, vars, regs, lines);
@@ -745,15 +820,20 @@ buildAnchorThread(const AnchorBracket &br,
     // --- anchor itself ---
     emitAnchor(br.anchor, br.anchorAlloc, vars, regs, lines);
 
-    // --- ordering between anchor and after ---
-    if (anchorIdx >= 0 && afterIdx >= 0 && anchorIdx < afterIdx) {
-        auto ois = collectOrderingBetween(insts, anchorIdx, afterIdx);
-        emitOrderingInsts(ois, lines);
-    }
+    // For fence-style anchors only: also emit the post-fence ordering and
+    // the "after" access on P0.  Publish anchors and external-acquire
+    // anchors stop the producer body at the anchor point.
+    if (!dropAfterOnP0) {
+        // --- ordering between anchor and after ---
+        if (anchorIdx >= 0 && afterIdx >= 0 && anchorIdx < afterIdx) {
+            auto ois = collectOrderingBetween(insts, anchorIdx, afterIdx);
+            emitOrderingInsts(ois, lines);
+        }
 
-    // --- after access ---
-    if (br.after) {
-        emitAccess(*br.after, vars, regs, lines);
+        // --- after access ---
+        if (br.after) {
+            emitAccess(*br.after, vars, regs, lines);
+        }
     }
 
     return lines;
@@ -796,21 +876,76 @@ buildPartnerThread(const std::vector<PartnerAccess> &accesses,
     }
 
     // Channel variable: if the anchor is an inline-ASM store-release to a
-    // channel object, a partner Load from that same object should be emitted
-    // as LDAR (acquire load) rather than a plain LDR.
+    // channel object, OR a synthetic strict-publish plain store, a partner
+    // Load from that same object should be emitted as LDAR (acquire load)
+    // rather than a plain LDR — and hoisted to the front to preserve the
+    // MP-consumer pattern.
     //
     // For external-function anchors (e.g. _printk, kfree) emitAnchor now
     // emits a DMB barrier rather than an STLR, so the anchorAlloc variable is
     // never written by P0.  Using it as a "channel" would produce an LDAR of
     // a variable that is always 0 → degenerate test.
-    bool anchorIsAsmStore = (br.anchorAlloc && br.anchor.site == "asm sideeffect");
+    bool anchorIsAsmStore = (br.anchorAlloc &&
+                             (br.anchor.site == "asm sideeffect" ||
+                              br.anchor.site == "store plain"));
     std::string chanVar;
     if (anchorIsAsmStore)
         chanVar = vars.var(br.anchorAlloc->objDesc);
 
-    // Emit accesses in order, with ordering insts before/between them
-    for (size_t i = 0; i < accesses.size(); ++i) {
-        int hi = accessIdx[i];
+    // Local mutable copies — we may reorder so the channel-LDAR is hoisted
+    // to the front.  See rationale below.
+    std::vector<PartnerAccess> orderedAccesses = accesses;
+    std::vector<int> orderedAccessIdx = accessIdx;
+
+    // For a valid MP-pattern test, the partner-side LDAR on the channel
+    // object MUST precede any plain LDR of payload data: an LDAR has
+    // *acquire* semantics that forbid LATER accesses from being hoisted
+    // above it, but does NOT prevent EARLIER plain loads from being
+    // reordered past it on AArch64.  If the partner function's source-order
+    // happens to place the payload load before the channel-acquire load
+    // (a common artifact when CausalDetect picks accesses regardless of
+    // their relation to the synchronisation), the emitted litmus produces
+    // a false-positive "No" verdict.
+    //
+    // Reorder once, up front: hoist any channel-LDAR access to the front
+    // of the access list (stable within the rest).  This faithfully models
+    // the semantics of an acquire-then-payload consumer.
+    if (!chanVar.empty() && orderedAccesses.size() > 1) {
+        auto isChanLoadAt = [&](size_t i) {
+            const std::string &ir = orderedAccesses[i].irInst;
+            bool isStore = (ir.size() >= 6 && ir.compare(0, 6, "store ") == 0)
+                        || ir.find("stlr")  != std::string::npos
+                        || ir.find("stlxr") != std::string::npos
+                        || ir.find("swpal") != std::string::npos;
+            return !isStore &&
+                   vars.var(orderedAccesses[i].objDesc) == chanVar;
+        };
+        std::vector<size_t> chanIdx, otherIdx;
+        for (size_t i = 0; i < orderedAccesses.size(); ++i) {
+            if (isChanLoadAt(i)) chanIdx.push_back(i);
+            else                 otherIdx.push_back(i);
+        }
+        if (!chanIdx.empty() && !otherIdx.empty() && chanIdx.front() != 0) {
+            std::vector<PartnerAccess> reordered;
+            std::vector<int> reorderedIdx;
+            reordered.reserve(orderedAccesses.size());
+            reorderedIdx.reserve(orderedAccessIdx.size());
+            for (size_t k : chanIdx) {
+                reordered.push_back(orderedAccesses[k]);
+                reorderedIdx.push_back(orderedAccessIdx[k]);
+            }
+            for (size_t k : otherIdx) {
+                reordered.push_back(orderedAccesses[k]);
+                reorderedIdx.push_back(orderedAccessIdx[k]);
+            }
+            orderedAccesses = std::move(reordered);
+            orderedAccessIdx = std::move(reorderedIdx);
+        }
+    }
+
+    // Emit accesses in (possibly reordered) order, with ordering insts before/between them
+    for (size_t i = 0; i < orderedAccesses.size(); ++i) {
+        int hi = orderedAccessIdx[i];
 
         if (i == 0) {
             // Prefix scan: function start → first access.
@@ -831,7 +966,7 @@ buildPartnerThread(const std::vector<PartnerAccess> &accesses,
             }
         } else {
             // Between previous access and this one
-            int lo = accessIdx[i - 1];
+            int lo = orderedAccessIdx[i - 1];
             if (lo >= 0 && hi >= 0 && lo < hi) {
                 auto ois = collectOrderingBetween(insts, lo, hi);
                 emitOrderingInsts(ois, lines);
@@ -840,26 +975,36 @@ buildPartnerThread(const std::vector<PartnerAccess> &accesses,
 
         // Build a SharedAccess from PartnerAccess for emitAccess
         SharedAccess sa;
-        sa.objDesc = accesses[i].objDesc;
-        sa.irInst  = accesses[i].irInst;
+        sa.objDesc = orderedAccesses[i].objDesc;
+        sa.irInst  = orderedAccesses[i].irInst;
         // Determine kind from IR text
-        const std::string &ir = accesses[i].irInst;
+        const std::string &ir = orderedAccesses[i].irInst;
         bool isStore = (ir.size() >= 6 && ir.compare(0, 6, "store ") == 0)
                     || ir.find("stlr")  != std::string::npos
                     || ir.find("stlxr") != std::string::npos
                     || ir.find("swpal") != std::string::npos;
         sa.kind = isStore ? SharedAccess::Kind::Store : SharedAccess::Kind::Load;
 
-        // If this is a Load from the channel object, emit as LDAR (acquire
-        // load) rather than a plain LDR.  This covers the common kernel
-        // pattern where smp_load_acquire(&chan) lowers to an inline-asm
-        // "ldar" CallInst whose argument is the channel pointer.  That
-        // CallInst is recorded by FunctionPairsPass as a partner access for
-        // the channel object, but emitAccess would only emit a plain LDR.
+        // If this is a Load from the channel object, emit it with the same
+        // ordering flavor the source IR uses:
+        //   * acquire-shaped ASM ("ldar" / "ldapr" / "ldaxr") or LLVM atomic
+        //     load_acquire / load_seq_cst        → LDAR W?,[X?]
+        //   * plain LLVM `load` (the consumer-side bug pattern)
+        //     or relaxed atomic load             → LDR W?,[X?]
+        //
+        // Faithfully reflecting the source ordering is REQUIRED to expose
+        // true positives.  Up-promoting a plain LDR to LDAR creates an
+        // artificial acquire that masks ordering bugs and produces false
+        // "Ok" verdicts on real ordering violations.
         bool isChanLoad = sa.kind == SharedAccess::Kind::Load
                        && !chanVar.empty()
                        && vars.var(sa.objDesc) == chanVar;
-        if (isChanLoad) {
+        bool srcIsAcquire = ir.find("ldar")  != std::string::npos
+                         || ir.find("ldapr") != std::string::npos
+                         || ir.find("ldaxr") != std::string::npos
+                         || ir.find("load acquire")    != std::string::npos
+                         || ir.find("load seq_cst")    != std::string::npos;
+        if (isChanLoad && srcIsAcquire) {
             const std::string &aReg = regs.addrReg(chanVar);
             std::string vReg        = regs.valReg(chanVar);
             lines.push_back("LDAR " + toW(vReg) + ",[" + aReg + "]");
@@ -1000,12 +1145,16 @@ static std::string buildExistsClause(
     //     a DMB barrier rather than an STLR, so the anchorAlloc variable is never
     //     written by P0 in the litmus — using it as the sync variable would make
     //     the sync condition trivially false (initial value 0 forever).
+    //   • For inline-asm fence anchors (smp_wmb / dmb / smp_mb / smp_rmb)
+    //     anchorAlloc is empty.  The "publication flag" is the AFTER store
+    //     (br.after); the BEFORE store is the payload.  Prefer br.after.
     //   • Fall back to the first LOAD val-reg for any P0-written variable.
     std::string syncReg, syncKey;
     if (br.anchorAlloc &&
-        br.anchor.site == "asm sideeffect" &&
-        (br.anchor.ordering == Ordering::Release ||
-         br.anchor.ordering == Ordering::SC))
+        ((br.anchor.site == "asm sideeffect" &&
+          (br.anchor.ordering == Ordering::Release ||
+           br.anchor.ordering == Ordering::SC))
+         || br.anchor.site == "store plain"))
     {
         const std::string chanVar = vars.var(br.anchorAlloc->objDesc);
         // Only use as sync if this is genuinely a LOAD (not a store) reg.
@@ -1015,6 +1164,22 @@ static std::string buildExistsClause(
             if (it != r1.varToReg.end()) {
                 syncReg = it->second;
                 syncKey = chanKey;
+            }
+        }
+    }
+    // Fence-anchor preference: use the after-store variable as sync.
+    if (syncReg.empty() &&
+        !br.anchorAlloc.has_value() &&
+        br.anchor.site == "asm sideeffect" &&
+        br.after && br.after->kind == SharedAccess::Kind::Store)
+    {
+        const std::string afterVar = vars.var(br.after->objDesc);
+        if (!p1StoreVarNames.count(afterVar)) {
+            const std::string afterKey = "val:" + afterVar;
+            auto it = r1.varToReg.find(afterKey);
+            if (it != r1.varToReg.end()) {
+                syncReg = it->second;
+                syncKey = afterKey;
             }
         }
     }
@@ -1080,8 +1245,7 @@ static std::string sanitise(const std::string &s)
 Herd7TranspilerResult
 Herd7TranspilerPass::run(Module &M, ModuleAnalysisManager &MAM)
 {
-    mbtime::Scope _t("transpiler");
-
+    mbtime::Scope _tTranspile("transpiler");
     Herd7TranspilerResult result;
 
     // ── Obtain filtered function pairs ────────────────────────────────────────
@@ -1177,12 +1341,27 @@ Herd7TranspilerPass::run(Module &M, ModuleAnalysisManager &MAM)
             // external-function anchors (e.g. _printk, kfree) emitAnchor now
             // emits a DMB barrier — not an STLR — so the anchorAlloc variable
             // is NOT written in the litmus thread and must not appear here.
+            //
+            // The "after" access is omitted from P0 in buildAnchorThread for
+            // publish anchors (anchorAlloc set) and external-function anchors,
+            // but RETAINED for inline-asm fence anchors (smp_wmb / smp_mb /
+            // smp_rmb / dmb / dsb).  p0WrittenVarNames must mirror that so the
+            // exists clause can use the after-store as the "sync" register.
+            const bool isFenceAnchor =
+                !br.anchorAlloc.has_value() &&
+                br.anchor.site == "asm sideeffect";
+            const bool dropAfterFromP0Writes = !isFenceAnchor;
             std::set<std::string> p0WrittenVarNames;
             if (br.before && br.before->kind == SharedAccess::Kind::Store)
                 p0WrittenVarNames.insert(vars.var(br.before->objDesc));
-            if (br.anchorAlloc && br.anchor.site == "asm sideeffect")
+            // Asm publish anchors (STLR/SWPAL) AND synthetic strict-publish
+            // anchors (plain STR) both write the channel variable.
+            if (br.anchorAlloc &&
+                (br.anchor.site == "asm sideeffect" ||
+                 br.anchor.site == "store plain"))
                 p0WrittenVarNames.insert(vars.var(br.anchorAlloc->objDesc));
-            if (br.after && br.after->kind == SharedAccess::Kind::Store)
+            if (!dropAfterFromP0Writes &&
+                br.after && br.after->kind == SharedAccess::Kind::Store)
                 p0WrittenVarNames.insert(vars.var(br.after->objDesc));
 
             // p1StoreVarNames: variables that P1 stores to.  Store val-regs

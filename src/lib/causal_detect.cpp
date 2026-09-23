@@ -28,6 +28,13 @@ using namespace SVF;
 AnalysisKey CausalDetectPass::Key;
 
 // ---------------------------------------------------------------------------
+// --strict-publish flag state (Action 2)
+// ---------------------------------------------------------------------------
+static bool g_strictPublish = false;
+void setStrictPublish(bool on) { g_strictPublish = on; }
+bool strictPublish()           { return g_strictPublish; }
+
+// ---------------------------------------------------------------------------
 // Helper: render an instruction to a compact one-line string
 // ---------------------------------------------------------------------------
 static std::string instToStr(const Instruction &I)
@@ -75,8 +82,7 @@ static std::string cleanObjDesc(SVFIR *pag, NodeID nid)
 CausalDetectResult CausalDetectPass::run(Module &M,
                                           ModuleAnalysisManager &MAM)
 {
-    mbtime::Scope _t("bracket_extraction");
-
+    mbtime::Scope _tBrackets("bracket_extraction");
     CausalDetectResult result;
 
     // ── 1. Run AnchorPass ───────────────────────────────────────────────────
@@ -388,6 +394,162 @@ CausalDetectResult CausalDetectPass::run(Module &M,
 
         if (!brackets.empty())
             result.perFunction[fnName] = std::move(brackets);
+    }
+
+    // ── 6. Strict-publish synthesis (Action 2 — TP detection in real kernel)
+    //
+    // When --strict-publish is on, scan every defined function for the
+    // canonical message-passing (MP) bug shape:
+    //
+    //     store payload, ptr @P        ; plain store, no STLR, no barrier
+    //     store flag,    ptr @F        ; plain store of publication flag
+    //
+    // A pair (S_payload, S_flag) is reported as a synthetic AnchorBracket
+    // representing a "missing release barrier" publish.  The bracket flows
+    // through function_pairs and herd7_transpiler exactly like a real anchor
+    // bracket; herd7_transpiler.emitAnchor specialises on hit.site=="store
+    // plain" to emit a plain STR (no STLR, no DMB).
+    //
+    // Filters applied to keep noise down:
+    //   - Function must have NO release-or-stronger anchor anywhere in its
+    //     body on any global (it is genuinely not synchronising via the
+    //     kernel APIs we recognise).
+    //   - Two stores must be to DIFFERENT shared objects (single-object
+    //     stores don't form an MP pattern).
+    //   - Both store targets must be GLOBAL (heap-only stores are scoped to
+    //     one allocation and not visible to a partner via name).
+    //   - We pick the FIRST shared-object store as payload and the FIRST
+    //     subsequent shared-object store to a DIFFERENT object as flag.
+    //   - We synthesise at most ONE bracket per function (the first MP
+    //     pair found) — keeps the candidate set bounded.
+    if (g_strictPublish) {
+        // Helper: given an LLVM Value*, return the first shared base
+        // GlobalVariable* it points to (or nullptr).  Used to identify
+        // the publication FLAG, which must be a named global so the partner
+        // consumer can pattern-match the same channel.
+        auto firstSharedGlobal = [&](const Value *ptrVal) -> const GlobalVariable * {
+            if (!msSet->hasValueNode(ptrVal)) return nullptr;
+            NodeID nid = msSet->getValueNode(ptrVal);
+            const PointsTo &pts = pta->getPts(nid);
+            for (NodeID obj : pts) {
+                NodeID base = obj;
+                if (const auto *g = dyn_cast<GepObjVar>(pag->getGNode(obj)))
+                    base = g->getBaseObj()->getId();
+                if (!sharedObjIds.count(base)) continue;
+                SVFVar *v = pag->getGNode(base);
+                if (v && msSet->hasLLVMValue(v)) {
+                    if (const auto *GV =
+                            dyn_cast<GlobalVariable>(msSet->getLLVMValue(v)))
+                        return GV;
+                }
+            }
+            return nullptr;
+        };
+
+        // Helper: opaque "shared object id" for a store target.  Used so the
+        // payload and flag are required to refer to DIFFERENT shared objects.
+        // We use the base PAG NodeID; heap-allocated payloads return the
+        // heap NodeID, globals return the global NodeID.
+        auto firstSharedBaseId = [&](const Value *ptrVal) -> NodeID {
+            if (!msSet->hasValueNode(ptrVal)) return 0;
+            NodeID nid = msSet->getValueNode(ptrVal);
+            const PointsTo &pts = pta->getPts(nid);
+            for (NodeID obj : pts) {
+                NodeID base = obj;
+                if (const auto *g = dyn_cast<GepObjVar>(pag->getGNode(obj)))
+                    base = g->getBaseObj()->getId();
+                if (sharedObjIds.count(base))
+                    return base;
+            }
+            return 0;
+        };
+
+        for (Function &F : M) {
+            if (F.isDeclaration())
+                continue;
+            const std::string fname = F.getName().str();
+
+            // Skip if function already contains any inline-asm release-or-
+            // stronger anchor (STLR, DMB ST, smp_store_release, …).  External
+            // SC functions like __kmalloc_cache_noprof or flush_work are
+            // incidental side effects, NOT synchronisation primitives that
+            // pair the payload to the flag — leave them eligible for
+            // strict-publish synthesis.
+            auto aIt = anchors.perFunction.find(fname);
+            if (aIt != anchors.perFunction.end()) {
+                bool hasInlineAsmRelOrStronger = false;
+                for (const AnchorHit &h : aIt->second) {
+                    if (h.site == "asm sideeffect" &&
+                        h.ordering >= anchors::Ordering::Release) {
+                        hasInlineAsmRelOrStronger = true;
+                        break;
+                    }
+                }
+                if (hasInlineAsmRelOrStronger)
+                    continue;
+            }
+
+            // Walk instructions, collect plain / volatile (WRITE_ONCE) shared
+            // stores in program order.  Atomic stores are excluded since they
+            // already have ordering semantics modelled elsewhere.
+            //   - payload:  any shared object (heap or global)
+            //   - flag:     must be a shared GLOBAL (so partner can match by name)
+            struct PStore {
+                const StoreInst *si;
+                NodeID           baseId;       // 0 if not shared
+                const GlobalVariable *flagGV;  // non-null iff this store targets a shared global
+            };
+            std::vector<PStore> pstores;
+            for (BasicBlock &BB : F) {
+                for (Instruction &I : BB) {
+                    auto *SI = dyn_cast<StoreInst>(&I);
+                    if (!SI) continue;
+                    if (SI->isAtomic()) continue;   // already ordered
+                    NodeID b = firstSharedBaseId(SI->getPointerOperand());
+                    if (!b) continue;
+                    const GlobalVariable *GV =
+                        firstSharedGlobal(SI->getPointerOperand());
+                    pstores.push_back({SI, b, GV});
+                }
+            }
+            if (pstores.size() < 2)
+                continue;
+
+            // Find first (payload, flag) pair:
+            //   - flag must be a shared global (flagGV != nullptr)
+            //   - payload must precede flag in program order
+            //   - payload.baseId != flag.baseId (distinct shared objects)
+            const StoreInst *payloadSI = nullptr;
+            const StoreInst *flagSI    = nullptr;
+            for (size_t j = 1; j < pstores.size() && !flagSI; ++j) {
+                if (!pstores[j].flagGV) continue;
+                for (size_t i = 0; i < j; ++i) {
+                    if (pstores[i].baseId == pstores[j].baseId) continue;
+                    payloadSI = pstores[i].si;
+                    flagSI    = pstores[j].si;
+                    break;
+                }
+            }
+            if (!payloadSI || !flagSI)
+                continue;
+
+            // Build the synthetic bracket.
+            AnchorBracket bracket;
+            bracket.anchor.label    = "store (plain, no barrier)";
+            bracket.anchor.site     = "store plain";
+            bracket.anchor.ordering = anchors::Ordering::Relaxed;
+            bracket.anchor.asmInst  = "";
+            bracket.anchorAlloc =
+                makeAccess(*flagSI, flagSI->getPointerOperand(),
+                           SharedAccess::Kind::Store);
+            bracket.before =
+                makeAccess(*payloadSI, payloadSI->getPointerOperand(),
+                           SharedAccess::Kind::Store);
+            // bracket.after intentionally empty — the flag store IS the
+            // publication; nothing after it is relevant for the MP test.
+
+            result.perFunction[fname].push_back(std::move(bracket));
+        }
     }
 
     AndersenWaveDiff::releaseAndersenWaveDiff();

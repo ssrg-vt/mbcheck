@@ -50,8 +50,7 @@ static std::string instToStr(const Instruction &I)
 FunctionPairsResult FunctionPairsPass::run(Module &M,
                                             ModuleAnalysisManager &MAM)
 {
-    mbtime::Scope _t("function_pairing");
-
+    mbtime::Scope _tPairing("function_pairing");
     FunctionPairsResult result;
 
     // ── 1. Obtain CausalDetect results ──────────────────────────────────────
@@ -412,6 +411,40 @@ FunctionPairsResult FunctionPairsPass::run(Module &M,
                             // barrierChannelIds plays the same role.
                             const DenseSet<NodeID> &effectiveChannelIds =
                                 hasChannel ? channelIds : barrierChannelIds;
+                            // Helper: is this Value an SVF-known pointer that
+                            // points to (or aliases) a channel object?
+                            auto svfHitsChannel = [&](const Value *p) -> bool {
+                                if (!p || !p->getType()->isPointerTy())
+                                    return false;
+                                if (!msSet->hasValueNode(p)) return false;
+                                NodeID pNid = msSet->getValueNode(p);
+                                const PointsTo &pts = pta->getPts(pNid);
+                                for (NodeID obj : pts) {
+                                    NodeID b = obj;
+                                    if (const auto *g = dyn_cast<GepObjVar>(
+                                            pag->getGNode(obj)))
+                                        b = g->getBaseObj()->getId();
+                                    if (effectiveChannelIds.count(b))
+                                        return true;
+                                }
+                                return false;
+                            };
+                            // Helper: producer publishes the payload via inline-asm
+                            // STLR (smp_store_release / cmpxchg_release / xchg /
+                            // ...).  SVF cannot see those stores, so pts(@channel)
+                            // has no payload object.  When ptrV is derived from a
+                            // *plain* load of @channel (consumer-side bug pattern:
+                            // missing READ_ONCE / smp_load_acquire), we infer that
+                            // the dereference targets the payload causal object.
+                            // Returns the causal/relevant payload id, or ~0u.
+                            auto attributeChannelDerived = [&]() -> NodeID {
+                                if (hasChannel && !causalIds.empty())
+                                    return *causalIds.begin();
+                                for (NodeID rid : relevantIds)
+                                    if (!effectiveChannelIds.count(rid))
+                                        return rid;
+                                return ~0u;
+                            };
                             if (!effectiveChannelIds.empty()) {
                                 const Value *base = ptrV;
                                 if (const auto *GEP =
@@ -442,25 +475,35 @@ FunctionPairsResult FunctionPairsPass::run(Module &M,
                                                     b = g->getBaseObj()->getId();
                                                 if (effectiveChannelIds.count(b) ||
                                                     relevantIds.count(b)) {
-                                                    // ptrV is derived by reading
-                                                    // a channel pointer; attribute
-                                                    // the access to the payload.
-                                                    // Alloc case: causalIds holds
-                                                    // the payload object.
-                                                    if (hasChannel &&
-                                                        !causalIds.empty())
-                                                        return *causalIds.begin();
-                                                    // Barrier case: return the
-                                                    // first relevant object that
-                                                    // is not the channel itself.
-                                                    for (NodeID rid : relevantIds)
-                                                        if (!effectiveChannelIds
-                                                                 .count(rid))
-                                                            return rid;
+                                                    NodeID r =
+                                                        attributeChannelDerived();
+                                                    if (r != ~0u) return r;
                                                     return b;
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                                // Plain-load chain: kernel writes the channel via
+                                // inline-asm STLR (smp_store_release) which SVF
+                                // cannot track; consumer reads with a plain LLVM
+                                // `load ptr, ptr @channel` (the "bug" pattern: no
+                                // READ_ONCE / smp_load_acquire).  We then see:
+                                //   %p = load ptr, ptr @channel       (channel ld)
+                                //   %v = load i32, ptr %p              ← ptrV=%p
+                                //   call f(ptr %p)                     ← ptrV=%p
+                                //   %g = gep ..., ptr %p; load ..., %g ← ptrV=%g
+                                // Detect: walk back through GEPs to the LoadInst,
+                                // then check if the load's address-operand points
+                                // to a channel object via SVF.
+                                const Value *p = ptrV;
+                                if (const auto *GEP =
+                                        dyn_cast<GetElementPtrInst>(p))
+                                    p = GEP->getPointerOperand();
+                                if (const auto *LD = dyn_cast<LoadInst>(p)) {
+                                    if (svfHitsChannel(LD->getPointerOperand())) {
+                                        NodeID r = attributeChannelDerived();
+                                        if (r != ~0u) return r;
                                     }
                                 }
                             }

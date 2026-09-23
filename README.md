@@ -8,6 +8,7 @@ Memory Ordering Violations under WMM* (USENIX ATC '26).
 
 ## Contents
 
+- [Container](#container)
 - [Requirements](#requirements)
 - [Install](#install)
   - [1. Packages](#1-packages)
@@ -176,6 +177,16 @@ export KDIR=~/linux-6.19        # table8 only
 `HERD7` and `HERDLIB` only when herd7 is not on `$PATH` or its `.cat` files
 cannot be found from the binary.
 
+## Container
+
+A prebuilt image with the toolchain, the kernel tree and the IR corpus
+already in place:
+
+```sh
+docker run --rm -it ghcr.io/ssrg-vt/mbcheck:atc26
+scripts/run.sh smoke
+```
+
 ## Quick start
 
 ```sh
@@ -224,8 +235,8 @@ brackets, function pairs before and after filtering, litmus tests and
 violations. About 7 minutes at 16 jobs.
 
 **Expectation:** 3,160 modules, 6,856,865 IR lines, ~169,500 anchors, ~37,750
-causal brackets, ~857,400 raw pairs, ~121,500 surviving, ~39,000 litmus tests,
-76 violations.
+causal brackets, ~857,400 raw pairs, ~120,400 surviving, ~25,700 litmus tests,
+31 violations.
 
 IR lines are lower than the paper's because the corpus is built at `-g0`; the
 paper's figure retains the debug info the kernel's own commands emit.
@@ -300,22 +311,15 @@ Table 9, *Kernel result sweep by MBCheck*: the per-module distribution of the
 violations behind the true-positive, borderline and false-positive counts.
 Cached.
 
-**Expectation:** 76 violations across 29 modules, with 22 of the paper's 25
-module rows present and 17 at the same count.
+**Expectation:** 31 violations across 7 modules: `mm/swapfile` 13,
+`drivers/tty/vt/keyboard` 6,
+`drivers/firmware/arm_scmi/transports/scmi_transport_optee` 3,
+`kernel/events/callchain` 3, `kernel/rcu/tree` 3,
+`drivers/soc/fsl/qbman/qman_ccsr` 2, `kernel/audit` 1.
 
-Rows that match include `drivers/tty/vt/keyboard` 6,
-`drivers/firmware/arm_sdei` 4, `drivers/soc/fsl/qbman/qman_ccsr` 3,
-`drivers/pci/controller/pci-xgene-msi` 2, `drivers/tty/serial/mvebu-uart` 2,
-`drivers/cpufreq/qcom-cpufreq-hw` 2, `drivers/pmdomain/mediatek/mtk-scpsys` 2,
-`drivers/soc/xilinx/zynqmp_power` 2, `drivers/tty/serial/8250/8250` 2.
-
-`kernel/time/timekeeping`, `fs/buffer` and
-`drivers/usb/gadget/udc/snps_udc_core` do not appear. The sweep also reports
-modules the paper's table does not list, the largest being
-`drivers/soc/qcom/smem` 16 and `net/core/skbuff` 6.
-
-The paper's TP, borderline and FP columns are a manual triage and are not
-produced by a run.
+Table 9 is being revised: the paper's figures are from Linux v6.19, and the
+revision restates the table against v7.3-rc4. The counts above are what the
+current tool reports on v6.19 and will not match the published table.
 
 ### all
 
@@ -332,9 +336,14 @@ src/            passes, herd7 transpiler, driver
 src/script/     sweep runner, IR corpus generator, patch synthesis
 src/spec/       TLA+ specification for the transpiler obligations
 scripts/        claim runner, corpus and test-suite builders, self-test
+container/      Dockerfile for the prebuilt image
 tests/          kernel-sync (23 synchronisation idioms), kernel-nb, kernel-ptr
 results/        sweep logs, litmus tests, JSON summaries (generated)
 ```
+
+`src/include/lib/ext_fn_summary.h` and `src/include/lib/anchors.h` carry the
+external-function ordering table and the anchor API classification, compiled
+in rather than read at run time.
 
 ## Troubleshooting
 
