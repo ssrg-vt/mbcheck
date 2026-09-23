@@ -1,0 +1,81 @@
+API,Path,Anchors (in execution order),Summarized Ordering,Conditional?,Ordering (per path)
+spin_lock,1/64+,casa,Acquire,No,Acquire (LSE)
+spin_unlock,1/1,stlrb,Release,No,Release (STLR)
+spin_lock_irq,1/64+,msr daifset -> casa,Acquire,No,IRQ/interrupt control | Acquire (LSE)
+spin_unlock_irq,1/1,stlrb -> msr daifclr,Release,No,Release (STLR) | IRQ/interrupt control
+spin_lock_irqsave,1/64+,mrs daif -> msr daifset -> casa,Acquire,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE)
+spin_unlock_irqrestore,1/1,stlrb -> msr daif,Release,No,Release (STLR) | IRQ/interrupt control
+mutex_lock,1/64+,casa,Acquire,No,Acquire (LSE)
+mutex_unlock,1/64+,casl,Release,No,Release (LSE)
+,3/64+,casl -> casl -> mrs daif -> msr daifset -> casa -> stlrb -> msr daif,SL,Yes,Release (LSE) | IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+down,1/64+,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+up,1/64+,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+down_read,1/64+,ldadda -> casal,SC,Yes,Acquire (LSE) | Full/AcqRel (LSE)
+,3/64+,ldadda,Acquire,No,Acquire (LSE)
+up_read,1/64+,ldaddl -> mrs daif -> msr daifset -> casa -> stlrb -> msr daif,SL,No,Release (LSE) | IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+down_write,1/64+,casa,Acquire,No,Acquire (LSE)
+,2/64+,casa -> msr daifset -> casa -> stset -> dmb ish -> casa -> stlrb -> msr daifclr,SC,Yes,Acquire (LSE) | IRQ/interrupt control | Relaxed (LSE) | Full (DMB ISH) | Release (STLR)
+up_write,1/64+,ldaddl,Release,No,Release (LSE)
+,2/64+,ldaddl -> mrs daif -> msr daifset -> casa -> stlrb -> msr daif,SL,Yes,Release (LSE) | IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+write_seqlock,1/64+,casa -> dmb ishst,LS,No,Acquire (LSE) | Release (store fence)
+write_sequnlock,1/1,dmb ishst -> stlrb,Release,No,Release (store fence) | Release (STLR)
+read_seqbegin,1/2,ldar,Acquire,No,Acquire (LDAR)
+read_seqretry,1/3,ldar -> dmb ishld,Acquire,No,Acquire (LDAR) | Acquire (load fence)
+read_lock,1/64+,ldadda,Acquire,No,Acquire (LSE)
+read_unlock,1/2,ldaddal,SC,Yes,Full/AcqRel (LSE)
+,2/2,ldxr ; stlxr,Release,No,Release (exclusive store)
+write_lock,1/64+,casa,Acquire,No,Acquire (LSE)
+write_unlock,1/1,stlrb,Release,No,Release (STLR)
+synchronize_rcu,1/64+,dmb ish -> dmb ish -> mrs daif -> msr daifset -> msr daif,SC,No,Full (DMB ISH) | IRQ flags save | IRQ/interrupt control
+synchronize_rcu_expedited,1/64+,dmb ish -> dmb ish -> mrs daif -> msr daifset -> msr daif,SC,No,Full (DMB ISH) | IRQ flags save | IRQ/interrupt control
+synchronize_rcu_sched,1/64+,dmb ish -> dmb ish -> mrs daif -> msr daifset -> msr daif,SC,No,Full (DMB ISH) | IRQ flags save | IRQ/interrupt control
+synchronize_rcu_bh,1/64+,dmb ish -> dmb ish -> mrs daif -> msr daifset -> msr daif,SC,No,Full (DMB ISH) | IRQ flags save | IRQ/interrupt control
+synchronize_srcu,1/64+,ldar -> mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,Acquire (LDAR) | IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+,2/64+,ldar -> mrs daif -> msr daifset -> casa -> stlrb -> msr daif -> ldar -> ldar -> ldxr ; stxr ; ldadd -> dmb ish -> ldar -> mrs daif -> msr daifset -> casa -> msr daif -> mrs daif -> msr daifset -> casa -> stlrb -> msr daif -> mrs daif -> msr daifset -> casa -> dmb ish -> stlrb -> msr daif -> ldar -> mrs daif -> msr daifset -> casa -> msr daif -> mrs daif -> msr daifset -> casa -> stlr -> stlrb -> msr daif -> dmb ish -> ldxr ; stxr ; ldadd -> msr daifset -> casa -> stlrb -> msr daifclr -> msr daifset -> casa -> dmb ish,SC,Yes,Acquire (LDAR) | IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR) | Relaxed (exclusive load) | Full (DMB ISH)
+rcu_barrier,1/64+,dmb ish -> casa -> dmb ish -> casl,SC,No,Full (DMB ISH) | Acquire (LSE) | Release (LSE)
+call_rcu,1/63,mrs daif -> msr daifset -> msr daif,none,No,IRQ flags save | IRQ/interrupt control
+,3/63,mrs daif -> msr daifset -> mrs daif -> msr daifset -> casa -> msr daif -> dmb ish -> casa -> dmb ish -> stlrb -> msr daif,SC,Yes,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Full (DMB ISH) | Release (STLR)
+rcu_assign_pointer,1/1,stlr,Release,No,Release (STLR)
+rcu_dereference,-,(no ordering insns found),none,No,
+wake_up,1/64+,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+wake_up_all,1/64+,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+wake_up_interruptible,1/64+,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+wake_up_interruptible_all,1/64+,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+wake_up_sync,1/63,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+wake_up_locked,-,(no ordering insns found),none,No,
+prepare_to_wait,1/64+,mrs daif -> msr daifset -> casa -> dmb ish -> stlrb -> msr daif -> ldar,SC,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Full (DMB ISH) | Release (STLR) | Acquire (LDAR)
+finish_wait,1/64+,mrs daif -> msr daifset -> casa -> dmb ish -> stlrb -> msr daif -> ldar,SC,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Full (DMB ISH) | Release (STLR) | Acquire (LDAR)
+wait_event,1/64+,mrs daif -> msr daifset -> casa -> dmb ish -> stlrb -> msr daif,SC,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Full (DMB ISH) | Release (STLR)
+wait_event_interruptible,1/64+,mrs daif -> msr daifset -> casa -> dmb ish -> stlrb -> msr daif,SC,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Full (DMB ISH) | Release (STLR)
+wait_for_completion,1/64+,msr daifset -> casa -> stlrb -> msr daifclr -> msr daifset -> casa,LS,No,IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+wait_for_completion_interruptible,1/64+,msr daifset -> casa -> stlrb -> msr daifclr -> msr daifset -> casa,LS,No,IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+wait_for_completion_timeout,1/64+,msr daifset -> casa -> stlrb -> msr daifclr -> msr daifset -> casa,LS,No,IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+complete,1/64+,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+complete_all,1/64+,mrs daif -> msr daifset -> casa -> stlrb -> msr daif,LS,No,IRQ flags save | IRQ/interrupt control | Acquire (LSE) | Release (STLR)
+set_current_state,1/1,dmb ish,SC,No,Full (DMB ISH)
+schedule,-,(no ordering insns found),none,No,
+yield,1/1,dmb ish -> msr daifset -> msr daifclr,SC,No,Full (DMB ISH) | IRQ/interrupt control
+try_to_wake_up,-,(no ordering insns found),none,No,
+test_and_set_bit,1/2,ldsetal,SC,No,Full/AcqRel (LSE)
+test_and_clear_bit,1/2,ldclral,SC,No,Full/AcqRel (LSE)
+test_and_change_bit,1/2,ldeoral,SC,No,Full/AcqRel (LSE)
+clear_bit_unlock,1/2,ldclrl,Release,No,Release (LSE)
+local_irq_disable,1/1,msr daifset,none,No,IRQ/interrupt control
+local_irq_enable,1/1,msr daifclr,none,No,IRQ/interrupt control
+local_irq_save,1/1,mrs daif -> msr daifset -> msr daif,none,No,IRQ flags save | IRQ/interrupt control
+local_irq_restore,1/1,msr daif,none,No,IRQ/interrupt control
+local_bh_disable,-,(no ordering insns found),none,No,
+local_bh_enable,1/1,mrs daif -> msr daifset -> msr daif,none,No,IRQ flags save | IRQ/interrupt control
+dma_wmb,1/1,dmb oshst,Acquire,No,Release (store fence)
+dma_rmb,1/1,dmb oshld,Acquire,No,Acquire (load fence)
+dma_mb,1/1,dmb osh,SC,No,Full (DMB OSH)
+readl,1/1,ldar -> dmb oshld,Acquire,No,Acquire (LDAR) | Acquire (load fence)
+writel,1/1,dmb oshst,Acquire,No,Release (store fence)
+inl,-,(no ordering insns found),none,No,
+outl,-,(no ordering insns found),none,No,
+ioread32,1/1,ldar -> dmb oshld,Acquire,No,Acquire (LDAR) | Acquire (load fence)
+iowrite32,1/1,dmb oshst,Acquire,No,Release (store fence)
+readl_relaxed,1/1,ldar,Acquire,No,Acquire (LDAR)
+writel_relaxed,-,(no ordering insns found),none,No,
+readsb,1/1,ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb -> ldarb,Acquire,No,Acquire (LDAR)
+writesw,-,(no ordering insns found),none,No,

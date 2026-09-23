@@ -1,0 +1,35 @@
+01_simple_addr.c            Basic address-of: p = &x; single pointer, single global object.
+02_two_ptrs_same_obj.c      Two independent pointers (p, q) both targeting the same global object.
+03_copy_propagation.c       Copy propagation: q = p causes q to inherit p's points-to set.
+04_flow_overwrite.c         Flow-sensitive strong update: p = &x then p = &y; only y survives at exit.
+05_conditional_branch.c     if/else branches assign p = &x or p = &y; join point yields p -> {x, y}.
+06_heap_malloc.c            Single malloc allocation; pointer tracks one heap object.
+07_two_heaps.c              Two separate malloc calls produce two distinct heap objects.
+08_pointer_to_pointer.c     Two-level indirection: pp = &p, p = &x; pp -> {p}, p -> {x}.
+09_array_decay.c            Array name decays to pointer; SVF creates one abstract object for the array.
+10_struct_field_ptr.c       Struct with a pointer field; field sensitivity: s.ptr -> {x}.
+11_ptr_to_struct.c          Pointer to a struct; struct fields tracked as GEP objects.
+12_return_ptr_static.c      Function returns pointer to its own static local variable.
+13_function_arg_write.c     Output-parameter pattern: callee writes *out = malloc(...); p receives heap object.
+14_global_multi_fn.c        Global pointer updated by two separate functions; final set covers both targets.
+15_function_ptr.c           Function pointer reassigned to two functions; fp -> {foo_obj, bar_obj}.
+16_static_local.c           Two calls to the same function both return address of the same static; p == q.
+17_array_of_ptrs.c          Array of pointer elements; each slot assigned a different global's address.
+18_struct_of_ptrs.c         Struct with two pointer fields pointing to separate globals.
+19_linked_list.c            Heap-allocated singly-linked list; next pointers connect distinct heap nodes.
+20_void_ptr_cast.c          void* cast to int*; both vp and ip track the same underlying object.
+21_loop_addr.c              Address-of taken inside a loop; pointer table entries filled per iteration.
+22_multi_level_heap.c       Two-level heap: pp -> {heap block}, *pp -> {inner heap block}.
+23_swap_ptrs.c              Pointer swap via double-pointer argument; p and q exchange targets after call.
+24_chain_deref.c            Three-level pointer chain: l3 -> l2 -> l1 -> x.
+25_union_ptr.c              Union with int and pointer field; pointer field points to global x.
+26_cpp_new.cpp              C++ new/delete heap allocation; pointer tracks one heap int object.
+27_cpp_ref.cpp              C++ reference modelled internally as a pointer; r binds to x.
+28_cpp_class_ptr.cpp        Class with raw pointer member; constructor initialises data field.
+29_cpp_virtual.cpp          Virtual dispatch; base pointer holds derived heap object; vtable GEPs visible.
+30_cpp_inherit.cpp          Upcast Derived* -> Base*; gp points to a stack Dog object.
+31_cpp_template.cpp         Two instantiations of getAddr<T>; each returns pointer to its own global.
+32_cpp_this_ptr.cpp         'this' pointer inside methods tracks the calling Counter object.
+33_cpp_overload.cpp         Overloaded getPtr for int& and float&; each overload returns its own global.
+34_cpp_lambda.cpp           Lambda captures pointer by value; lambda closure field points to global x.
+35_cpp_placement_new.cpp    Placement new into stack buffer; pp points to stack array, not heap.

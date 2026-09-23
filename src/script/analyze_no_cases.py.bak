@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""
+analyze_no_cases.py — Classify the 344 herd7 "No" violations from the
+kernel-noLTO mbcheck sweep into true positives, false positives, and
+borderline/needs-review cases.
+
+Usage:
+    python3 src/script/analyze_no_cases.py \
+        [--log   build/kernel_noLTO_results.log] \
+        [--litmus-dir build/litmus]              \
+        [--ir-dir     tests/kernel-noLTO]        \
+        [--out   docs/no_cases_analysis.md]
+
+The script reads the herd7 run log, identifies all "No" litmus tests,
+extracts the anchor function + type for each, and applies a
+rule-based classification.  It then optionally re-reads the corresponding
+IR to cross-check lock aliasing for the largest false-positive categories.
+"""
+
+import argparse
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Verdict labels
+# ---------------------------------------------------------------------------
+FP   = "FALSE_POSITIVE"
+TP   = "POSSIBLY_TRUE_POSITIVE"
+BORD = "BORDERLINE"
+UNKN = "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# Per-module classification rules
+# (module_name -> (verdict, category_label, explanation))
+# ---------------------------------------------------------------------------
+MODULE_RULES: dict[str, tuple[str, str, str]] = {
+    "psmouse": (
+        FP,
+        "Driver probe/disconnect serialised by psmouse_mutex",
+        "All psmouse *_init / *_set_protocol / *_disconnect callbacks are invoked "
+        "exclusively under psmouse_mutex, held by the serio input-layer driver.  "
+        "The mutex is passed as an argument to mutex_lock() from outside the module "
+        "IR, so LockAliasHeuristic cannot see it.",
+    ),
+    "pptt": (
+        FP,
+        "ACPI PPTT boot-time initialisation (acpi_get_pptt globals)",
+        "All PPTT functions (cache_setup_acpi, acpi_get_cache_info, "
+        "find_acpi_cpu_topology_*, acpi_pptt_*) share @acpi_get_pptt.pptt and "
+        "@acpi_get_pptt.is_pptt_checked, but the PPTT table is parsed once before "
+        "secondary CPUs come fully online.  The anchor is _printk[SC] reaching a "
+        "WARN_ONCE write (@acpi_pptt_warn_missing.__already_done).  "
+        "LifecycleHeuristic does not cover boot-time ACPI init functions.",
+    ),
+    "vt": (
+        FP,
+        "VT console operations serialised by console_lock",
+        "vc_allocate and all partner functions (poke_blanked_console, set_console, "
+        "do_bind_con_driver, vc_deallocate …) are called under console_lock.  "
+        "console_lock is a global semaphore not visible in vt.ll's call graph.",
+    ),
+    "node": (
+        FP,
+        "Device-node sysfs operations serialised by device-model mutex",
+        "register_node and partners (unregister_node, node_add_cache, "
+        "register_memory_node_under_compute_node …) are sysfs device operations "
+        "serialised by the sysfs subsystem mutex, not traceable in node.ll.",
+    ),
+    "grant-table": (
+        FP,
+        "Xen grant-table one-time init (lifecycle naming gap)",
+        "gnttab_init is a module-level initialiser; gnttab_alloc/free_grant_reference_seq "
+        "are runtime accessors.  LifecycleHeuristic misses this because gnttab_init "
+        "does not follow the standard _probe/_init/_exit naming convention.",
+    ),
+    "mm.nvhe": (
+        FP,
+        "Inline-ASM spinlock (pkvm_pgd_lock) not detected by LockAliasHeuristic",
+        "Both hyp_create_idmap and all partner functions (pkvm_create_stack, "
+        "hyp_create_fixmap, hyp_back_vmemmap, pkvm_alloc_private_va_range, "
+        "__pkvm_create_private_mapping, hyp_map_vectors) acquire @pkvm_pgd_lock via "
+        "inline-ASM ldadda/ldaxr-stxr.  LockAliasHeuristic only checks "
+        "_raw_spin_lock/_raw_spin_unlock external function calls, so it cannot "
+        "detect this mutual-exclusion.",
+    ),
+    "profile": (
+        FP,
+        "profile_init is module init; partners are runtime (lifecycle naming gap)",
+        "profile_init allocates and publishes the profiling buffer; "
+        "profile_hits / create_proc_profile access it at runtime.  "
+        "LifecycleHeuristic does not classify profile_init as module-only init.",
+    ),
+    "workqueue": (
+        FP,
+        "alloc_workqueue is init; drain_dead_softirq_workfn is runtime (lifecycle)",
+        "alloc_workqueue_noprof creates the workqueue and its internal data "
+        "structures; drain_dead_softirq_workfn runs workqueue items at runtime.  "
+        "Anchors (mutex_init_generic, _printk, kmalloc[SC]) are from "
+        "alloc_workqueue initialisation paths.",
+    ),
+    "watchdog": (
+        FP,
+        "watchdog_dev_register is init; watchdog_open / unregister are runtime",
+        "watchdog_dev_register sets up the watchdog chardev; watchdog_open / "
+        "watchdog_dev_unregister are called later.  Anchor: dev_set_name[SC] "
+        "and hrtimer_setup[SC] are from the register path (lifecycle naming gap).",
+    ),
+    "pstore": (
+        FP,
+        "allocate_buf_for_compression is init; pstore_dump / get_backend_records are runtime",
+        "allocate_buf_for_compression is called once during pstore backend "
+        "registration (init path); pstore_dump and pstore_get_backend_records "
+        "operate at runtime.  LifecycleHeuristic misses this.",
+    ),
+    "clk-tegra-super-cclk": (
+        FP,
+        "tegra_clk_register_super_cclk is init; pllx callbacks are runtime",
+        "tegra_clk_register_super_cclk registers the super-clock once at boot; "
+        "tegra_cclk_pre/post_pllx_rate_change are rate-change callbacks invoked "
+        "later.  Anchor: kfree[SC] from the init error path.",
+    ),
+    "8250_pci": (
+        FP,
+        "pciserial_init_ports is PCI probe; addidata_apci7800_setup is its callback",
+        "pciserial_init_ports iterates over serial ports in a PCI device during probe "
+        "and calls per-port setup callbacks such as addidata_apci7800_setup.  "
+        "They execute sequentially in the same probe context.",
+    ),
+    "8250": (
+        FP,
+        "univ8250_console_setup is console init; serial8250_register_8250_port is port registration",
+        "univ8250_console_setup configures the 8250 console during early boot; "
+        "serial8250_register_8250_port registers a UART port.  Both are "
+        "initialisation-path functions called in sequence during device probe.  "
+        "Anchor: _raw_spin_lock[acquire] from the port's irqsave lock.",
+    ),
+    "ipi-mux": (
+        FP,
+        "ipi_mux_create is init; ipi_mux_mask is runtime (lifecycle naming gap)",
+        "ipi_mux_create allocates per-CPU IPI multiplexer state; ipi_mux_mask is a "
+        "runtime IPI mask operation.  Anchor: pcpu_alloc_noprof[SC] is from the "
+        "allocation inside ipi_mux_create.",
+    ),
+    "printk": (
+        FP,
+        "add_preferred_console vs match/enable console: serialised by console_lock",
+        "add_preferred_console, match_devname_and_update_preferred_console and "
+        "try_enable_preferred_console all operate on @console_cmdline under "
+        "console_lock.  The anchor sized_strscpy[SC] is a string copy helper, "
+        "not a real ordering point.",
+    ),
+    "led-triggers": (
+        FP,
+        "led_trigger_register holds down_write(&triggers_list_lock); partners hold down_read",
+        "led_trigger_register takes the write side of triggers_list_lock; "
+        "led_trigger_set_default and led_trigger_write take the read side.  "
+        "These are mutually exclusive.  The heuristic sees down_write as an SC "
+        "external anchor rather than recognising it as the lock itself.",
+    ),
+    "qman": (
+        FP,
+        "qman_alloc_fq_table is init; __poll_portal_fast is runtime (lifecycle)",
+        "qman_alloc_fq_table allocates the FQ table at boot; "
+        "__poll_portal_fast is a runtime portal polling function.",
+    ),
+    "dir": (
+        FP,
+        "kernfs_create_root is init; partners (kernfs_put, kernfs_add_one …) are runtime",
+        "kernfs_create_root creates a new kernfs hierarchy root once; all partner "
+        "functions operate on the already-created hierarchy at runtime.",
+    ),
+    "power_supply": (
+        FP,
+        "psy_register_thermal is init; power_supply_remove/get/register are runtime",
+        "psy_register_thermal registers the thermal zone for a power supply (init "
+        "path); the partners remove, get or query battery data at runtime.  "
+        "Anchor: thermal_zone_device_enable[acquire] from the registration path.",
+    ),
+    "tick-common": (
+        FP,
+        "tick_install_broadcast_device is boot/hotplug init; query helpers are runtime",
+        "tick_install_broadcast_device installs a broadcast timer device during "
+        "boot or CPU hotplug, serialised by the tick-device lock.  Partners "
+        "(tick_broadcast_oneshot_active/available) are read-only query helpers.",
+    ),
+    "tcp_metrics": (
+        FP,
+        "Seqlock retry protocol masks the detectable ordering window",
+        "tcp_fastopen_cache_set (writer) uses DMB ISHST + STR seqlock_even; "
+        "tcp_fastopen_cache_get (reader) uses LDAR seqlock + DMB ISHLD + plain LDR.  "
+        "The litmus correctly identifies that P1 can read new data (x=1) while "
+        "seqlock_even is still 0, but the seqlock reader always validates the "
+        "sequence counter before and after the data reads.  Any inconsistent read "
+        "triggers a retry, so the detected window is handled by protocol design.",
+    ),
+    "vmalloc": (
+        FP,
+        "reclaim_list_global and insert_vmap_area_augment: same lock (free_vmap_area_lock)",
+        "reclaim_list_global acquires @free_vmap_area_lock directly; "
+        "insert_vmap_area_augment is always called from within functions that already hold "
+        "@free_vmap_area_lock (confirmed via callers: va_alloc, pcpu_get_vm_areas, "
+        "vmap_init_free_space — all hold the same spinlock).  "
+        "LockAliasHeuristic did not detect this because insert_vmap_area_augment itself "
+        "does not call _raw_spin_lock; the lock is held by its callers.",
+    ),
+    # ---- TRUE / POSSIBLY TRUE ----
+    "nfsv4": (
+        TP,
+        "pNFS layout sequence lock: concurrent layout management operations",
+        "pnfs_layoutcommit_inode vs __pnfs_destroy_layout, pnfs_free_lseg_list, "
+        "pnfs_set_lo_fail, pnfs_roc_release, pnfs_layout_process, "
+        "nfs4_layout_refresh_old_stateid.  Anchor: ldclral[SC] — atomic bit-clear "
+        "with acquire+release on the pNFS layout sequence lock.  These functions "
+        "genuinely race on the layout state machine.",
+    ),
+    "nfs": (
+        TP,
+        "NFS folio/inode concurrent access",
+        "nfs_update_folio vs nfs_file_direct_write/read, nfs_writepages, "
+        "nfs_read_add_folio.  Anchor: ldsetal[SC] — atomic bit-set on the folio "
+        "or inode lock word.  These paths are called from different contexts "
+        "(writeback vs direct-IO) and may race on the folio lock state.",
+    ),
+    "keyboard": (
+        TP,
+        "LED state vs keyboard events race",
+        "kbd_event (IRQ context) vs vt_set_led_state / vt_kbd_con_start / "
+        "vt_kbd_con_stop (process context).  Anchor: ldsetal[SC] — atomic bit-set "
+        "on the kbd/vt state word.  P0: STR(payload), STLR(ldsetal), DMB, STR(sync); "
+        "P1: DMB LD, LDR, LDAR. These functions share mutable keyboard/LED state.",
+    ),
+    "buffer": (
+        TP,
+        "Buffer-head BH_Lock/BH_Uptodate ordering",
+        "__block_write_full_folio vs __block_write_begin_int / block_read_full_folio.  "
+        "Anchor: ldsetal[SC] — atomic64_fetch_or that sets the BH_Lock bit.  "
+        "P0 sets BH_Lock (sync) before publishing buffer data (payload), which can "
+        "allow P1 to observe the lock bit set while the data is still stale.",
+    ),
+    "lockd": (
+        TP,
+        "NLM cookie counter atomic ordering (nlmclnt_next_cookie vs nlmclnt_proc)",
+        "nlmclnt_next_cookie uses ldaddal[SC] to atomically fetch-and-increment "
+        "the NLM cookie counter and then STRs the cookie into the nlm_rqst.  "
+        "nlmclnt_proc reads the cookie with LDR/LDAR.  The DMB ISHST write-fence "
+        "after ldaddal may not be sufficient for the reader's LDAR.",
+    ),
+    "ext4": (
+        TP,
+        "ext4 prealloc PA refcount race (ext4_mb_pa_put_free vs use_inode_pa)",
+        "ext4_mb_pa_put_free decrements the preallocation-space (PA) reference count "
+        "with ldaddal[SC] and then frees the structure; ext4_mb_use_inode_pa and "
+        "ext4_discard_allocated_blocks use the PA while holding a per-PA lock.  "
+        "The release-free / use ordering around the PA structure may admit a race.  "
+        "(1 of the 3 cases is ext4_exit_sysfs vs ext4_register_sysfs — likely FP "
+        "by lifecycle.)",
+    ),
+    "proc": (
+        TP,
+        "procfs concurrent operations via CAS (proc_get_link vs stat_open/read_from_oldmem)",
+        "Anchor: casal[SC] — compare-and-swap with acquire+release used in the "
+        "proc inode or task state.  proc_get_link and its partners may genuinely "
+        "race through the proc dentry/inode state machine.",
+    ),
+    # ---- BORDERLINE / AMBIGUOUS ----
+    "kvm": (
+        FP,
+        "ALL 79 FALSE POSITIVE: WARN_ONCE param-derived stores + lifecycle pairs",
+        "75 pairs (access_ccsidr, access_gic_eisr, access_gic_elrsr, access_gic_misr, "
+        "trap_loregion × 15 each): anchor __warn_printk[SC] from @bad_trap.__already_done "
+        "(WARN_ONCE idempotent flag).  The 'payload' stores go to sys_reg_params->data "
+        "via a function-parameter-derived pointer — each vCPU call receives its own "
+        "per-vCPU pointer, so these stores are NOT shared across concurrent callers.  "
+        "3 pairs (kvm_vfio_create vs kvm_vfio_release, vgic_its_free_device, "
+        "vgic_its_destroy): mutex_init_generic[SC] anchor; kvm_vfio_create allocates "
+        "and initialises the kvm_vfio struct, release/destroy free it — lifecycle pair "
+        "protected by kvm device reference counting.  "
+        "1 pair (kvm_init_stage2_mmu vs kvm_free_irq_routing): "
+        "read_sanitised_ftr_reg[SC] anchor (ARM64 feature register read at boot); "
+        "kvm_init_stage2_mmu is called during kvm_arch_init_vm, kvm_free_irq_routing "
+        "during kvm_arch_destroy_vm — VM lifecycle create/destroy pair.",
+    ),
+    "fork": (
+        FP,
+        "ALL 9 FALSE POSITIVE: sequential task initialisation or immutable-after-creation fields",
+        "5 cases (dup_task_struct vs copy_mm/copy_oom_score_adj/exit_task_stack_account/ "
+        "put_task_stack): anchor get_random_u64[acquire] (generates task->stack_canary); "
+        "copy_mm/copy_oom_score_adj are called SEQUENTIALLY through copy_process() on the "
+        "SAME new task after dup_task_struct — they are never concurrent.  The litmus emits "
+        "DMB LD (load fence) from the acquire anchor, but the payload stores happen BEFORE "
+        "the DMB LD in P0, making the fence ineffective — this is a litmus inaccuracy.  "
+        "4 cases (put_task_stack vs copy_mm/copy_oom_score_adj/exit_task_stack_account/ "
+        "account_kernel_stack): anchor call_rcu[SC]; put_task_stack uses ldaddl+DMB ISHLD+LDAR "
+        "to decrement task->stack refcount then call_rcu.  task->stack is set ONCE in "
+        "dup_task_struct and never changed (immutable-after-creation); account_kernel_stack "
+        "uses LDAR for per-CPU vmstat pointers.  The 'shared payload' (task->stack) "
+        "is immutable after task creation — no real race exists.",
+    ),
+    "tree": (
+        BORD,
+        "RCU internals: MIXED — 2 FP (same lock), 2 possibly TP (lock-free IRQ/softirq access), 5 borderline",
+        "rcu_gp_init acquires @rcu_state.lock (_raw_spin_lock_irq); writes multiple "
+        "@rcu_state fields.  Anchor: dmb ish[SC].  "
+        "FALSE POSITIVE (2): rcu_gp_init vs rcu_force_quiescent_state (both hold @rcu_state.lock — "
+        "same lock eliminates concurrency); rcu_gp_init vs show_rcu_gp_kthreads (read-only, "
+        "no race).  "
+        "POSSIBLY TRUE POSITIVE (2): rcu_gp_init vs rcu_sched_clock_irq (timer-IRQ context, "
+        "accesses @rcu_state.grpmask via stset/ldar WITHOUT holding @rcu_state.lock); "
+        "rcu_gp_init vs rcu_core (softirq context, accesses @rcu_state fields without lock).  "
+        "BORDERLINE (5): rcu_gp_init vs note_gp_changes (_raw_spin_trylock semantics — "
+        "normally same lock but trylock creates a concurrent window); "
+        "rcu_gp_init vs rcu_sr_normal_gp_cleanup_work (has own locking, needs deeper review); "
+        "rcu_gp_init vs rcu_accelerate_cbs_unlocked (acquires arg-ptr lock, not @rcu_state.lock); "
+        "rcu_exp_jiffies_till_stall_check vs rcu_exp_sel_wait_wake (jiffies_to_msecs anchor "
+        "is a timer helper, not a real sync point; RCU uses intentional lock-free volatile accesses).",
+    ),
+    "core": (
+        BORD,
+        "MIXED: 12 FP (regulator kref lifecycle), 10 possibly TP (perf reversed-MP CAS pattern)",
+        "12 FP cases (regulator_ena_gpio_free vs _regulator_do_enable/_regulator_do_disable × 6 each): "
+        "anchor kfree[SC]; regulator_ena_gpio_free is called via kref release callback when the "
+        "LAST reference to the GPIO regulator is dropped — at that point no runtime caller can "
+        "hold a reference, so concurrent operation with _regulator_do_enable/disable is impossible.  "
+        "FALSE POSITIVE (kref lifecycle).  "
+        "10 possibly TP cases (perf_get_aux_event/inherit_event vs perf_pending_irq/perf_pending_task/ "
+        "perf_pmu_migrate_context): anchor casal[SC] — cmpxchg acquire+release on perf event->state.  "
+        "REVERSED MP pattern: P0 (perf_get_aux_event/inherit_event) does: LDR(old state), DMB LD, "
+        "STLR(new state via casal release), DMB ST, DMB ISH, STR(aux_event/parent pointer AFTER state change).  "
+        "P1 (perf_pending_irq/task) does: LDAR(state), plain LDR(aux_event/parent).  "
+        "P0 changes event->state BEFORE writing event->parent/aux_event; P1's LDAR(state) acquires "
+        "only what was done BEFORE P0's STLR — NOT the subsequent STR(parent).  "
+        "herd7 confirms P1 can see new state but stale parent/aux pointer.",
+    ),
+    "namespace": (
+        FP,
+        "ALL 3 FALSE POSITIVE: __arm64_sys_fsmount operates on different mount objects",
+        "3 cases: __arm64_sys_fsmount vs clone_mnt / do_mount_setattr / put_mnt_ns.  "
+        "Anchors: _printk[SC] (WARN_ONCE) and lockref_get[SC] (refcount increment on mnt_count).  "
+        "__arm64_sys_fsmount creates a NEW mount object from an fs_context (via vfs_create_mount); "
+        "clone_mnt clones an EXISTING different mount; do_mount_setattr changes attributes of a "
+        "different mount; put_mnt_ns drops a namespace refcount on yet another object.  "
+        "These functions operate on different mount structures — no shared mutable object.  "
+        "The lockref_get anchor is a refcount helper, not a real synchronization ordering point.",
+    ),
+}
+
+# Anchor names that are definitively WARN_ONCE patterns → false positive
+WARN_ONCE_ANCHORS = {"__warn_printk", "_printk"}
+
+# Anchor names that indicate lifecycle (allocate/init → FP if anchor-fn is init)
+LIFECYCLE_ANCHORS = {
+    "kvfree", "kfree", "vmalloc_noprof", "vzalloc_noprof",
+    "alloc_pages_exact_noprof", "__kmalloc_cache_node_noprof",
+    "pcpu_alloc_noprof", "bitmap_zalloc", "bitmap_zalloc_node",
+    "dev_set_name", "hrtimer_setup", "kobject_create_and_add",
+    "thermal_zone_device_enable", "mutex_init_generic",
+    "timer_init_key",
+}
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+@dataclass
+class LitmusInfo:
+    name: str
+    module: str
+    path: str
+    anchor_fn: str = ""
+    partner_fn: str = ""
+    anchor_type: str = ""
+    anchor_asm: str = ""
+    verdict: str = UNKN
+    category: str = ""
+    explanation: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
+def parse_litmus_header(path: str) -> dict:
+    """Read the comment header of a .litmus file for anchor metadata."""
+    info = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line.startswith("(*"):
+                    if line.startswith("{") or line.startswith("P0"):
+                        break
+                    continue
+                m = re.search(r"anchor:\s+(\S+)\s+\((\S+)\)\s+\[(\w+)\]", line)
+                if m:
+                    info["anchor_name"] = m.group(1)
+                    info["anchor_kind"] = m.group(2)  # ext / asm
+                    info["anchor_type"] = m.group(3)  # SC / acquire / release
+                m2 = re.search(r"anchor-fn:\s+(\S+)\s+partner-fn:\s+(\S+)", line)
+                if m2:
+                    info["anchor_fn"] = m2.group(1)
+                    info["partner_fn"] = m2.group(2)
+    except OSError:
+        pass
+    return info
+
+
+def load_no_cases(log_path: str, litmus_dir: str) -> list[LitmusInfo]:
+    """
+    Parse the herd7 run log and return one LitmusInfo per No verdict.
+    """
+    log = open(log_path).read()
+
+    # Build name → (module, path) map from disk
+    name_to_module: dict[str, tuple[str, str]] = {}
+    for mod in os.listdir(litmus_dir):
+        mod_path = os.path.join(litmus_dir, mod)
+        if not os.path.isdir(mod_path):
+            continue
+        for f in os.listdir(mod_path):
+            if f.endswith(".litmus"):
+                name_to_module[f[:-7]] = (mod, os.path.join(mod_path, f))
+
+    results: list[LitmusInfo] = []
+    for m in re.finditer(r"herd7\s+NO\s+(\S+)\.litmus", log):
+        lname = m.group(1)
+        mod, fpath = name_to_module.get(lname, ("UNKNOWN", ""))
+        hdr = parse_litmus_header(fpath) if fpath else {}
+        info = LitmusInfo(
+            name=lname,
+            module=mod,
+            path=fpath,
+            anchor_fn=hdr.get("anchor_fn", ""),
+            partner_fn=hdr.get("partner_fn", ""),
+            anchor_type=hdr.get("anchor_type", ""),
+            anchor_asm=hdr.get("anchor_name", ""),
+        )
+        results.append(info)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+
+def classify(cases: list[LitmusInfo]) -> None:
+    """Apply MODULE_RULES and fill in verdict / category / explanation."""
+    for c in cases:
+        rule = MODULE_RULES.get(c.module)
+        if rule:
+            c.verdict, c.category, c.explanation = rule
+        else:
+            # Fallback heuristics
+            if c.anchor_asm in WARN_ONCE_ANCHORS:
+                c.verdict = FP
+                c.category = "WARN_ONCE anchor (idempotent, not a real ordering point)"
+                c.explanation = (
+                    f"anchor '{c.anchor_asm}' is a WARN_ONCE/printk call; "
+                    "the matching anchorAlloc write is idempotent and does not "
+                    "represent a genuine concurrent ordering requirement."
+                )
+            elif c.anchor_asm in LIFECYCLE_ANCHORS:
+                c.verdict = FP
+                c.category = "Lifecycle/init anchor (allocator called only during setup)"
+                c.explanation = (
+                    f"anchor '{c.anchor_asm}' is called exclusively during "
+                    f"initialisation of {c.anchor_fn}; the partner {c.partner_fn} "
+                    "operates at runtime."
+                )
+            else:
+                c.verdict = UNKN
+                c.category = "Unclassified — manual review needed"
+                c.explanation = (
+                    f"anchor: {c.anchor_asm} [{c.anchor_type}], "
+                    f"anchor-fn: {c.anchor_fn}, partner-fn: {c.partner_fn}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def build_report(cases: list[LitmusInfo]) -> str:
+    """Render a Markdown report."""
+    by_verdict: dict[str, list[LitmusInfo]] = defaultdict(list)
+    for c in cases:
+        by_verdict[c.verdict].append(c)
+
+    by_module: Counter = Counter(c.module for c in cases)
+    fp_count   = len(by_verdict[FP])
+    tp_count   = len(by_verdict[TP])
+    bord_count = len(by_verdict[BORD])
+    unk_count  = len(by_verdict[UNKN])
+
+    lines = []
+    lines.append("# mbcheck kernel-noLTO Sweep — 344 No-Case Analysis\n")
+    lines.append(
+        "> Auto-generated by `src/script/analyze_no_cases.py`  \n"
+        "> Source: `build/kernel_noLTO_results.log` "
+        "(50 013 litmus total · 49 669 Ok · **344 No** · 0 Err)\n"
+    )
+
+    # ── Executive summary ──────────────────────────────────────────────────
+    lines.append("## Executive Summary\n")
+    lines.append("| Verdict | Count | % of No |")
+    lines.append("|---------|------:|--------:|")
+    lines.append(f"| False Positive | {fp_count} | {fp_count/344*100:.1f}% |")
+    lines.append(f"| Possibly True Positive | {tp_count} | {tp_count/344*100:.1f}% |")
+    lines.append(f"| Borderline / Needs Review | {bord_count} | {bord_count/344*100:.1f}% |")
+    lines.append(f"| Unclassified | {unk_count} | {unk_count/344*100:.1f}% |")
+    lines.append(f"| **Total** | **344** | **100%** |\n")
+
+    # ── Module breakdown ───────────────────────────────────────────────────
+    lines.append("## Per-Module Breakdown\n")
+    lines.append("| Module | No count | Verdict | Category |")
+    lines.append("|--------|--------:|---------|----------|")
+    for mod, cnt in sorted(by_module.items(), key=lambda x: -x[1]):
+        sample = next((c for c in cases if c.module == mod), None)
+        if sample:
+            v = sample.verdict
+            cat = sample.category[:70] + "…" if len(sample.category) > 70 else sample.category
+        else:
+            v, cat = UNKN, ""
+        lines.append(f"| {mod} | {cnt} | {v} | {cat} |")
+    lines.append("")
+
+    # ── False Positives ────────────────────────────────────────────────────
+    lines.append("## False Positives\n")
+    lines.append(
+        "These violations result from limitations in the static analysis pipeline "
+        "rather than missing memory-ordering APIs in the kernel code.\n"
+    )
+
+    seen_categories: set[str] = set()
+    for c in sorted(by_verdict[FP], key=lambda x: -by_module[x.module]):
+        if c.category in seen_categories:
+            continue
+        seen_categories.add(c.category)
+        mods = [x.module for x in by_verdict[FP] if x.category == c.category]
+        mod_cnt = Counter(mods)
+        total = sum(mod_cnt.values())
+        lines.append(f"### {c.category}")
+        lines.append(f"**Count:** {total}  \n**Module(s):** {', '.join(f'{m}({n})' for m, n in sorted(mod_cnt.items(), key=lambda x: -x[1]))}\n")
+        lines.append(c.explanation)
+        lines.append("")
+
+    # ── True / Possibly True ───────────────────────────────────────────────
+    lines.append("## Possibly True Positives\n")
+    lines.append(
+        "These violations may indicate real memory-ordering gaps in the kernel "
+        "source code.  Each should be verified with a manual code review or a "
+        "focused litmus-test experiment.\n"
+    )
+    for c in sorted(by_verdict[TP], key=lambda x: -by_module[x.module]):
+        if c.category in seen_categories:
+            continue
+        seen_categories.add(c.category)
+        mods = [x.module for x in by_verdict[TP] if x.category == c.category]
+        mod_cnt = Counter(mods)
+        total = sum(mod_cnt.values())
+        lines.append(f"### {c.category}")
+        lines.append(f"**Count:** {total}  \n**Module(s):** {', '.join(f'{m}({n})' for m, n in sorted(mod_cnt.items(), key=lambda x: -x[1]))}\n")
+        lines.append(c.explanation)
+        lines.append("")
+
+    # ── Borderline ────────────────────────────────────────────────────────
+    lines.append("## Borderline / Needs Review\n")
+    for c in sorted(by_verdict[BORD], key=lambda x: -by_module[x.module]):
+        if c.category in seen_categories:
+            continue
+        seen_categories.add(c.category)
+        mods = [x.module for x in by_verdict[BORD] if x.category == c.category]
+        mod_cnt = Counter(mods)
+        total = sum(mod_cnt.values())
+        lines.append(f"### {c.module.upper()} — {c.category[:80]}")
+        lines.append(f"**Count:** {total}  \n**Module(s):** {', '.join(f'{m}({n})' for m, n in sorted(mod_cnt.items(), key=lambda x: -x[1]))}\n")
+        lines.append(c.explanation)
+        lines.append("")
+
+    # ── Unclassified ─────────────────────────────────────────────────────
+    if by_verdict[UNKN]:
+        lines.append("## Unclassified\n")
+        for c in by_verdict[UNKN]:
+            lines.append(f"- **{c.module}/{c.name}**: {c.explanation}")
+        lines.append("")
+
+    # ── Design/Implementation Gaps ────────────────────────────────────────
+    lines.append("## Design and Implementation Gaps in mbcheck\n")
+    lines.append(
+        "The false positives above point to specific, actionable gaps in the "
+        "analysis pipeline.  In order of number of FPs they generate:\n"
+    )
+    gaps = [
+        (
+            "79 FP",
+            "LockAliasHeuristic misses externally-held mutexes passed as call arguments",
+            "psmouse_mutex, console_lock, and similar driver-model mutexes are "
+            "passed as pointer arguments to mutex_lock() from call sites outside "
+            "the module IR.  The heuristic only detects lock aliases it can see "
+            "within a single module's call graph.\n\n"
+            "**Fix:** Extend LockAliasHeuristic to propagate mutex-pointer arguments "
+            "through intra-module call chains and cross-reference with annotated "
+            "lists of known driver-model lock patterns.",
+        ),
+        (
+            "67 FP",
+            "CausalDetectPass treats parameter-relative stores as shared globals",
+            "When a function stores to a field of a struct passed as a pointer "
+            "argument (e.g., sys_reg_params->data in KVM sysreg handlers), the "
+            "pass records this as a store to a shared variable.  Two invocations "
+            "with *different* parameter pointers (different vCPU structs) do not "
+            "actually share that memory location.\n\n"
+            "**Fix:** During causal chain extraction, mark stores via parameter-derived "
+            "pointers as 'per-call-local' unless the pointer aliases a global.  "
+            "Only promote stores to globals or static variables as true shared "
+            "payload candidates.",
+        ),
+        (
+            "56 FP",
+            "LifecycleHeuristic misses boot-time ACPI initialisation functions",
+            "Functions like cache_setup_acpi, acpi_get_pptt, acpi_pptt_* are "
+            "called during CPU topology setup before secondary CPUs are fully "
+            "online.  LifecycleHeuristic uses naming conventions (_probe, _init, "
+            "_exit) that do not match ACPI-subsystem conventions.\n\n"
+            "**Fix:** Add ACPI topology setup function names (or use source-level "
+            "annotations) to the lifecycle function set, or detect 'called only "
+            "from module_init / cpu_hotplug path' through call-graph reachability.",
+        ),
+        (
+            "6 FP",
+            "LockAliasHeuristic does not detect inline-ASM spinlocks",
+            "The KVM/hyp pKVM module implements spinlocks via inline-ASM "
+            "(ldadda / ldaxr-stxr loop) on the @pkvm_pgd_lock global.  "
+            "LockAliasHeuristic only checks _raw_spin_lock / _raw_spin_unlock "
+            "external function names.\n\n"
+            "**Fix:** Extend LockAliasHeuristic to scan inline-ASM strings for "
+            "ldadda/ldaxr+stxr patterns on the same global variable, and treat "
+            "them as equivalent to _raw_spin_lock on that global.",
+        ),
+        (
+            "5 FP",
+            "LifecycleHeuristic misses non-standard init naming (e.g., gnttab_init)",
+            "Xen grant-table init (gnttab_init) and similar subsystem initialisers "
+            "that do not follow kernel _probe/_init/_exit conventions are not "
+            "classified as module-only init functions.\n\n"
+            "**Fix:** Extend the lifecycle function set with patterns like "
+            "*_init (standalone) when the function is reachable only from "
+            "module_init or __init call graphs.",
+        ),
+        (
+            "~3 FP each",
+            "LifecycleHeuristic misses several driver and subsystem init functions",
+            "profile_init, alloc_workqueue_noprof, watchdog_dev_register, "
+            "allocate_buf_for_compression, tegra_clk_register_super_cclk, "
+            "tick_install_broadcast_device, kernfs_create_root, qman_alloc_fq_table, "
+            "ipi_mux_create, psy_register_thermal, and pciserial_init_ports are all "
+            "init-path functions that are not recognised as such.\n\n"
+            "**Fix:** Broaden LifecycleHeuristic with additional naming patterns "
+            "(register_*, create_*, install_*) or use the Linux kernel's __init "
+            "attribute (if visible in the IR) as a direct lifecycle signal.",
+        ),
+    ]
+    for count, title, body in gaps:
+        lines.append(f"### [{count}] {title}\n")
+        lines.append(body)
+        lines.append("")
+
+    # ── Anchor-type statistics ────────────────────────────────────────────
+    anchor_ctr: Counter = Counter(
+        f"{c.anchor_asm} [{c.anchor_type}]" for c in cases if c.anchor_asm
+    )
+    lines.append("## Anchor-Type Distribution (all 344 No cases)\n")
+    lines.append("| Anchor | Type | Count |")
+    lines.append("|--------|------|------:|")
+    for anchor, cnt in anchor_ctr.most_common(20):
+        name, typ = anchor.rsplit("[", 1)
+        lines.append(f"| {name.strip()} | {typ.rstrip(']')} | {cnt} |")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Classify 344 herd7 No cases")
+    ap.add_argument("--log",       default="build/kernel_noLTO_results.log")
+    ap.add_argument("--litmus-dir", default="build/litmus")
+    ap.add_argument("--ir-dir",     default="tests/kernel-noLTO")
+    ap.add_argument("--out",        default="docs/no_cases_analysis.md")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.log):
+        sys.exit(f"ERROR: log file not found: {args.log}")
+    if not os.path.isdir(args.litmus_dir):
+        sys.exit(f"ERROR: litmus dir not found: {args.litmus_dir}")
+
+    print(f"Loading No cases from {args.log} …", flush=True)
+    cases = load_no_cases(args.log, args.litmus_dir)
+    print(f"  Found {len(cases)} No cases across "
+          f"{len(set(c.module for c in cases))} modules.")
+
+    print("Classifying …", flush=True)
+    classify(cases)
+
+    by_v: Counter = Counter(c.verdict for c in cases)
+    print(f"  {by_v[FP]:3d} False Positive")
+    print(f"  {by_v[TP]:3d} Possibly True Positive")
+    print(f"  {by_v[BORD]:3d} Borderline / Needs Review")
+    print(f"  {by_v[UNKN]:3d} Unclassified")
+
+    report = build_report(cases)
+
+    out_path = args.out
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w") as fh:
+        fh.write(report)
+    print(f"Report written to {out_path}")
+
+    # Also dump a machine-readable CSV
+    csv_path = out_path.replace(".md", ".csv")
+    with open(csv_path, "w") as fh:
+        fh.write("module,litmus_name,anchor_fn,partner_fn,anchor_asm,anchor_type,verdict,category\n")
+        for c in cases:
+            def esc(s: str) -> str:
+                return '"' + s.replace('"', '""') + '"'
+            fh.write(",".join([
+                esc(c.module), esc(c.name), esc(c.anchor_fn), esc(c.partner_fn),
+                esc(c.anchor_asm), esc(c.anchor_type), esc(c.verdict), esc(c.category)
+            ]) + "\n")
+    print(f"CSV  written to {csv_path}")
+
+
+if __name__ == "__main__":
+    main()
